@@ -51,6 +51,8 @@ https://ads-mcp.<аккаунт>.workers.dev/<MCP_SECRET>/mcp
 | `google_ads_conversion_update(conversion_action_id, phone_call_duration_seconds?, primary_for_goal?, apply?)` | С какой длительности звонок — конверсия; «основная» ли |
 | `google_ads_campaign_goal(campaign_id, category, origin, biddable, apply?)` | Участвует ли цель в ставках кампании |
 | `google_ads_pin_headlines(ad_id, texts, position, apply?)` | Закрепление существующих заголовков объявления (тексты не меняются) |
+| `google_ads_campaign_budget(campaign_id, daily_budget, apply?)` | Дневной бюджет кампании (общие бюджеты не трогает) |
+| `google_ads_keyword_match(campaign_id, keywords?, to_match?, apply?)` | Широкие слова → фразовые/точные: копия с новым типом, старое на паузу |
 
 Везде можно передать `customer_id` (иначе — аккаунт по умолчанию) и `login_customer_id` (доступ через MCC).
 

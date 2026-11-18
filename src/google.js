@@ -322,6 +322,57 @@ async function pinTool(env, args) {
   return { customer_id: cid, ...res, ad_id: id, headlines: headlines.map((h) => (h.pinnedField ? `${h.text}  [${h.pinnedField}]` : h.text)) };
 }
 
+async function budgetTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const camp = idOf(args.campaign_id, "campaign_id");
+  const amount = Number(args.daily_budget);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 100000) throw new Error("daily_budget — сумма в день в валюте аккаунта, больше 0");
+  const [row] = await gaql(env, cid, `SELECT campaign.name, campaign_budget.resource_name, campaign_budget.amount_micros, campaign_budget.explicitly_shared, campaign_budget.reference_count FROM campaign WHERE campaign.id = ${camp}`, login);
+  if (!row?.campaignBudget) throw new Error(`Кампания ${camp} не найдена`);
+  const b = row.campaignBudget;
+  // общий бюджет поменяет и другие кампании — такое этим инструментом не трогаем
+  if (b.explicitlyShared || Number(b.referenceCount || 1) > 1) throw new Error(`У кампании «${row.campaign.name}» общий бюджет на ${b.referenceCount} кампаний — меняйте его в интерфейсе Google Ads`);
+  const micros = String(Math.round(amount * 100) * 10000);
+  const res = await mutate(env, cid, [{ campaignBudgetOperation: { update: { resourceName: b.resourceName, amountMicros: micros }, updateMask: "amount_micros" } }], args.apply, login);
+  return { customer_id: cid, ...res, campaign: row.campaign.name, before: money(b.amountMicros), after: money(micros) };
+}
+
+async function keywordMatchTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const camp = idOf(args.campaign_id, "campaign_id");
+  const to = String(args.to_match || "PHRASE").toUpperCase();
+  if (!["PHRASE", "EXACT"].includes(to)) throw new Error("to_match: PHRASE или EXACT");
+  const only = args.keywords?.length ? new Set(args.keywords.map((t) => String(t).trim().toLowerCase())) : null;
+  const rows = await gaql(env, cid, `SELECT ad_group.resource_name, ad_group.name, ad_group_criterion.resource_name, ad_group_criterion.status, ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, ad_group_criterion.cpc_bid_micros, ad_group_criterion.final_urls FROM ad_group_criterion WHERE campaign.id = ${camp} AND ad_group_criterion.type = 'KEYWORD' AND ad_group_criterion.negative = FALSE AND ad_group_criterion.status != 'REMOVED' AND ad_group.status != 'REMOVED'`, login);
+  const list = rows.map((r) => ({ group: r.adGroup.resourceName, group_name: r.adGroup.name, res: r.adGroupCriterion.resourceName, status: r.adGroupCriterion.status, text: r.adGroupCriterion.keyword.text, match: r.adGroupCriterion.keyword.matchType, bid: r.adGroupCriterion.cpcBidMicros, urls: r.adGroupCriterion.finalUrls }));
+  const key = (g, t, m) => `${g}|${t.toLowerCase()}|${m}`;
+  const exist = new Map(list.map((k) => [key(k.group, k.text, k.match), k]));
+  // переводим только широкое соответствие
+  const src = list.filter((k) => k.match === "BROAD" && k.status === "ENABLED" && (!only || only.has(k.text.toLowerCase())));
+  if (!src.length) throw new Error(only ? "Среди включённых слов кампании в широком соответствии нет указанных" : "В кампании нет включённых слов в широком соответствии");
+  const ops = [];
+  const out = [];
+  for (const k of src) {
+    const twin = exist.get(key(k.group, k.text, to));
+    if (twin) {
+      // такое слово уже есть — включаем его, новое не создаём
+      if (twin.status !== "ENABLED") ops.push({ adGroupCriterionOperation: { update: { resourceName: twin.res, status: "ENABLED" }, updateMask: "status" } });
+    } else {
+      const create = { adGroup: k.group, status: "ENABLED", keyword: { text: k.text, matchType: to } };
+      if (k.bid) create.cpcBidMicros = k.bid;
+      if (k.urls?.length) create.finalUrls = k.urls;
+      ops.push({ adGroupCriterionOperation: { create } });
+    }
+    // старое слово — на паузу, не удаляем: откат = включить его обратно
+    ops.push({ adGroupCriterionOperation: { update: { resourceName: k.res, status: "PAUSED" }, updateMask: "status" } });
+    out.push({ keyword: k.text, ad_group: k.group_name, from: k.match, to, existing: Boolean(twin) });
+  }
+  const res = await mutate(env, cid, ops, args.apply, login);
+  return { customer_id: cid, ...res, campaign_id: camp, switched: out };
+}
+
 export const GOOGLE_TOOLS = [
   {
     name: "google_ads_status",
@@ -420,6 +471,29 @@ export const GOOGLE_TOOLS = [
       position: { type: "string", enum: ["HEADLINE_1", "HEADLINE_2", "HEADLINE_3", "NONE"] },
       apply: { type: "boolean", description: "true — применить; иначе только проверка" },
     }, ["ad_id", "texts", "position"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "google_ads_campaign_budget",
+    description: "Google Ads, ПРАВКА: дневной бюджет кампании (в валюте аккаунта). Общие бюджеты на несколько кампаний не трогает. Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      campaign_id: { type: "string" },
+      daily_budget: { type: "number", description: "Новый бюджет в день, напр. 60" },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["campaign_id", "daily_budget"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "google_ads_keyword_match",
+    description: "Google Ads, ПРАВКА: перевести ключевые слова кампании из широкого (BROAD) в фразовое или точное соответствие. Google не меняет тип у существующего слова, поэтому создаётся копия с новым типом, а старое ставится на паузу (откат — включить старое). keywords пусто — все включённые широкие слова кампании. Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      campaign_id: { type: "string" },
+      keywords: { type: "array", items: { type: "string" }, description: "Тексты слов (опц.; по умолчанию все)" },
+      to_match: { type: "string", enum: ["PHRASE", "EXACT"], description: "По умолчанию PHRASE" },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["campaign_id"]),
     annotations: { readOnlyHint: false, destructiveHint: false },
   },
 ];
@@ -561,6 +635,10 @@ export async function googleTool(name, args, env) {
       return campaignGoalTool(env, args);
     case "google_ads_pin_headlines":
       return pinTool(env, args);
+    case "google_ads_campaign_budget":
+      return budgetTool(env, args);
+    case "google_ads_keyword_match":
+      return keywordMatchTool(env, args);
 
     default:
       return undefined;
