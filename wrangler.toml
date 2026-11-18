@@ -3,10 +3,15 @@ main = "src/index.js"
 compatibility_date = "2025-10-01"
 workers_dev = true
 
+# KV: вход в Google Ads (страница /<MCP_SECRET>/google)
+[[kv_namespaces]]
+binding = "STATE"
+id = "0941b0420fa64e8bbbdf99414d8c88b6"
+
 [observability]
 enabled = true
 
 # Секреты задаются через GitHub Actions (wrangler secret put):
 # MCP_SECRET, YANDEX_DIRECT_TOKEN, YANDEX_DIRECT_LOGIN, VK_ADS_TOKEN,
-# GOOGLE_ADS_DEVELOPER_TOKEN, GOOGLE_ADS_CLIENT_ID, GOOGLE_ADS_CLIENT_SECRET,
-# GOOGLE_ADS_REFRESH_TOKEN, GOOGLE_ADS_LOGIN_CUSTOMER_ID
+# Google Ads (необязательно, иначе — страница /google): GOOGLE_ADS_CLIENT_ID, GOOGLE_ADS_CLIENT_SECRET,
+# GOOGLE_ADS_REFRESH_TOKEN, GOOGLE_ADS_LOGIN_CUSTOMER_ID, GOOGLE_ADS_DEVELOPER_TOKEN (больше не нужен)

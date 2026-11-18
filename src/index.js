@@ -1,18 +1,20 @@
 // ads-mcp — Cloudflare Worker
-// Реклама: Яндекс Директ (API v5) + VK Реклама (ads.vk.com) + Google Ads (заглушка/плумбинг).
+// Реклама: Яндекс Директ (API v5) + VK Реклама (ads.vk.com) + Google Ads (API v26: отчёты + узкий набор правок — src/google.js).
 // URL для коннектора: https://<worker>.workers.dev/<MCP_SECRET>/mcp
+// Подключение Google Ads: https://<worker>.workers.dev/<MCP_SECRET>/google
 // Секреты: MCP_SECRET,
 //   YANDEX_DIRECT_TOKEN (OAuth), YANDEX_DIRECT_LOGIN (Client-Login, опц.),
 //   VK_ADS_TOKEN,
-//   GOOGLE_ADS_DEVELOPER_TOKEN, GOOGLE_ADS_CLIENT_ID, GOOGLE_ADS_CLIENT_SECRET,
-//   GOOGLE_ADS_REFRESH_TOKEN, GOOGLE_ADS_LOGIN_CUSTOMER_ID (опц.).
+//   Google Ads — необязательно (страница /google сохраняет всё в KV): GOOGLE_ADS_CLIENT_ID, GOOGLE_ADS_CLIENT_SECRET,
+//   GOOGLE_ADS_REFRESH_TOKEN, GOOGLE_ADS_LOGIN_CUSTOMER_ID, GOOGLE_ADS_CUSTOMER_ID.
+
+import { GOOGLE_TOOLS, googleRoute, googleTool } from "./google.js";
 
 const PROTOCOL = "2025-06-18";
 const MAX_OUT = 50000;
 
 const DIRECT_API = "https://api.direct.yandex.com/json/v5";
 const VKADS_API = "https://ads.vk.com/api/v2";
-const GADS_API = "https://googleads.googleapis.com/v17";
 
 // ---------- инструменты ----------
 
@@ -97,37 +99,7 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
-  {
-    name: "google_ads_status",
-    description: "Google Ads: проверка готовности интеграции (какие секреты заданы). Не требует ключей. ⚠️ Google Ads требует developer token с длительной модерацией Google + OAuth.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
-  },
-  {
-    name: "google_ads_search",
-    description: "Google Ads: GAQL-запрос (searchStream). ⚠️ Требует одобренный developer token + OAuth (client id/secret/refresh) + customer_id. До готовности вернёт понятную ошибку.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        customer_id: { type: "string", description: "ID клиента Google Ads (можно с дефисами)" },
-        query: { type: "string", description: "GAQL, напр. SELECT campaign.id, campaign.name FROM campaign" },
-      },
-      required: ["customer_id", "query"],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "google_ads_request",
-    description: "Универсальный POST к Google Ads API v17. path относительно googleads.googleapis.com/v17. ⚠️ Требует полный набор секретов GOOGLE_ADS_* (см. google_ads_status).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Путь API, напр. /customers/1234567890/googleAds:searchStream" },
-        body: { type: "object", additionalProperties: true, description: "Тело запроса" },
-      },
-      required: ["path"],
-      additionalProperties: false,
-    },
-  },
+  ...GOOGLE_TOOLS,
 ];
 
 // ---------- утилиты ----------
@@ -213,31 +185,6 @@ async function vkads(env, method, path, { params, body } = {}) {
   return jfetch(qs(`${VKADS_API}${path}`, params), init);
 }
 
-// gadsToken — обмен refresh-токена на access-токен Google OAuth.
-let gadsCache = { token: null, exp: 0 };
-async function gadsToken(env) {
-  if (gadsCache.token && Date.now() < gadsCache.exp - 60000) return gadsCache.token;
-  const client_id = need(env, "GOOGLE_ADS_CLIENT_ID", "OAuth client_id Google Cloud.");
-  const client_secret = need(env, "GOOGLE_ADS_CLIENT_SECRET", "OAuth client_secret Google Cloud.");
-  const refresh_token = need(env, "GOOGLE_ADS_REFRESH_TOKEN", "OAuth refresh_token с доступом к Google Ads.");
-  const data = await jfetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "refresh_token", client_id, client_secret, refresh_token }),
-  });
-  gadsCache = { token: data.access_token, exp: Date.now() + (data.expires_in || 3600) * 1000 };
-  return gadsCache.token;
-}
-
-// gads — вызов Google Ads API v17 (POST).
-async function gads(env, path, body) {
-  const dev = need(env, "GOOGLE_ADS_DEVELOPER_TOKEN", "Developer token Google Ads. ⚠️ Одобрение Google занимает время — до этого API недоступен.");
-  const token = await gadsToken(env);
-  const headers = { Authorization: `Bearer ${token}`, "developer-token": dev, "Content-Type": "application/json" };
-  if (has(env, "GOOGLE_ADS_LOGIN_CUSTOMER_ID")) headers["login-customer-id"] = String(env.GOOGLE_ADS_LOGIN_CUSTOMER_ID).replace(/-/g, "");
-  return jfetch(`${GADS_API}${path}`, { method: "POST", headers, body: JSON.stringify(body || {}) });
-}
-
 // ---------- реализация инструментов ----------
 
 async function callTool(name, args, env) {
@@ -288,29 +235,11 @@ async function callTool(name, args, env) {
     case "vk_ads_request":
       return pretty(await vkads(env, args.method || "GET", args.path, { params: args.params, body: args.body }));
 
-    case "google_ads_status": {
-      const keys = ["GOOGLE_ADS_DEVELOPER_TOKEN", "GOOGLE_ADS_CLIENT_ID", "GOOGLE_ADS_CLIENT_SECRET", "GOOGLE_ADS_REFRESH_TOKEN", "GOOGLE_ADS_LOGIN_CUSTOMER_ID"];
-      const secrets = {};
-      for (const k of keys) secrets[k] = has(env, k);
-      const ready = secrets.GOOGLE_ADS_DEVELOPER_TOKEN && secrets.GOOGLE_ADS_CLIENT_ID && secrets.GOOGLE_ADS_CLIENT_SECRET && secrets.GOOGLE_ADS_REFRESH_TOKEN;
-      return pretty({
-        note: "Google Ads API требует developer token (одобрение Google занимает время), OAuth (client_id/secret/refresh_token) и, для MCC, login-customer-id.",
-        secrets,
-        ready,
-        hint: ready ? "Все ключевые секреты заданы — можно вызывать google_ads_search / google_ads_request." : "Задайте недостающие секреты GOOGLE_ADS_*.",
-      });
+    default: {
+      const g = await googleTool(name, args, env);
+      if (g === undefined) throw new Error(`Неизвестный инструмент: ${name}`);
+      return pretty(g);
     }
-
-    case "google_ads_search": {
-      const cid = String(args.customer_id || "").replace(/-/g, "");
-      return pretty(await gads(env, `/customers/${cid}/googleAds:searchStream`, { query: args.query }));
-    }
-
-    case "google_ads_request":
-      return pretty(await gads(env, args.path, args.body || {}));
-
-    default:
-      throw new Error(`Неизвестный инструмент: ${name}`);
   }
 }
 
@@ -334,7 +263,7 @@ async function handleMessage(msg, env) {
         return rpcResult(id, {
           protocolVersion: typeof params?.protocolVersion === "string" ? params.protocolVersion : PROTOCOL,
           capabilities: { tools: {} },
-          serverInfo: { name: "ads-mcp", version: "1.0.0" },
+          serverInfo: { name: "ads-mcp", version: "1.1.0" },
         });
       case "ping":
         return rpcResult(id, {});
@@ -366,6 +295,8 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean);
+    const page = await googleRoute(request, env, parts, url);
+    if (page) return page;
     const ok = env.MCP_SECRET && parts.length === 2 && parts[0] === env.MCP_SECRET && parts[1] === "mcp";
     if (!ok) return new Response("Not found", { status: 404 });
 
