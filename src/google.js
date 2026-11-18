@@ -1,4 +1,5 @@
-// Google Ads API — только чтение (отчёты), без изменений в аккаунтах.
+// Google Ads API — отчёты (только чтение) и узкий набор правок: минус-слова аккаунта, настройки конверсий,
+// цели кампаний, закрепление заголовков. Правка без apply: true только проверяется Google (validateOnly).
 // С 9 сентября 2026 developer token не нужен: доступ (Test / Explorer / Basic) выдаётся Google Cloud проекту,
 // которому принадлежит OAuth-клиент. Explorer — 2 880 операций в сутки по боевым аккаунтам, для отчётов хватает.
 //
@@ -186,6 +187,140 @@ const PERIOD = {
   date_to: { type: "string", description: "YYYY-MM-DD" },
 };
 const obj = (properties, required) => ({ type: "object", properties, ...(required ? { required } : {}), additionalProperties: false });
+const MATCH = ["PHRASE", "EXACT", "BROAD"];
+
+// ---------- правки ----------
+// Только то, что ниже: минус-слова аккаунта, настройки конверсии, цели кампании, закрепление заголовков.
+// Всё одной атомарной пачкой через googleAds:mutate; без apply — validateOnly (Google проверяет, ничего не меняя).
+
+async function mutate(env, cid, ops, apply, login) {
+  if (!ops.length) return { applied: false, changed: [] };
+  const data = await call(env, `/customers/${cid}/googleAds:mutate`, { body: { mutateOperations: ops, validateOnly: !apply }, login });
+  const changed = (data?.mutateOperationResponses || []).map((r) => Object.values(r)[0]?.resourceName).filter(Boolean);
+  return { applied: Boolean(apply), changed };
+}
+
+const idOf = (v, what) => {
+  const s = digits(v);
+  if (!/^\d+$/.test(s)) throw new Error(`${what} — число`);
+  return s;
+};
+
+function negativeOf(k) {
+  const text = String(typeof k === "string" ? k : k?.text || "").trim().replace(/\s+/g, " ").toLowerCase();
+  const match = String((typeof k === "object" && k?.match) || "PHRASE").toUpperCase();
+  if (!text || text.length > 80 || text.split(" ").length > 10) throw new Error(`минус-слово «${text}»: 1–80 символов, до 10 слов`);
+  if (/[!@%^*()={};~`<>?\\|,]/.test(text)) throw new Error(`минус-слово «${text}»: недопустимый символ`);
+  if (!MATCH.includes(match)) throw new Error(`match: ${MATCH.join(", ")}`);
+  return { text, match };
+}
+
+async function accountNegatives(env, cid, login) {
+  const sets = await gaql(env, cid, "SELECT shared_set.resource_name, shared_set.name, shared_set.member_count FROM shared_set WHERE shared_set.type = 'ACCOUNT_LEVEL_NEGATIVE_KEYWORDS' AND shared_set.status = 'ENABLED'", login);
+  const attached = new Set((await gaql(env, cid, "SELECT customer_negative_criterion.negative_keyword_list.shared_set FROM customer_negative_criterion WHERE customer_negative_criterion.type = 'NEGATIVE_KEYWORD_LIST'", login))
+    .map((r) => r.customerNegativeCriterion?.negativeKeywordList?.sharedSet).filter(Boolean));
+  const set = sets.map((r) => r.sharedSet).find((s) => attached.has(s.resourceName)) || sets[0]?.sharedSet || null;
+  const items = set
+    ? (await gaql(env, cid, `SELECT shared_criterion.resource_name, shared_criterion.keyword.text, shared_criterion.keyword.match_type FROM shared_criterion WHERE shared_set.id = ${set.resourceName.split("/").pop()}`, login))
+        .map((r) => ({ resource: r.sharedCriterion.resourceName, text: r.sharedCriterion.keyword?.text, match: r.sharedCriterion.keyword?.matchType }))
+        .filter((k) => k.text)
+    : [];
+  return { set, attached: Boolean(set && attached.has(set.resourceName)), items };
+}
+
+async function negativesTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const cur = await accountNegatives(env, cid, login);
+  const key = (k) => `${k.match}|${k.text.toLowerCase()}`;
+  if (args.action === "list") return { customer_id: cid, list: cur.set?.name || null, attached: cur.attached, count: cur.items.length, keywords: cur.items.map(({ text, match }) => ({ text, match })) };
+
+  const wanted = [...new Map((args.keywords || []).map(negativeOf).map((k) => [key(k), k])).values()];
+  if (!wanted.length) throw new Error("keywords — список минус-слов");
+  const have = new Map(cur.items.map((k) => [key(k), k]));
+
+  if (args.action === "remove") {
+    const found = wanted.filter((k) => have.has(key(k)));
+    const res = await mutate(env, cid, found.map((k) => ({ sharedCriterionOperation: { remove: have.get(key(k)).resource } })), args.apply, login);
+    return { customer_id: cid, ...res, removed: found, not_found: wanted.filter((k) => !have.has(key(k))) };
+  }
+  if (args.action !== "add") throw new Error("action: list, add, remove");
+
+  const fresh = wanted.filter((k) => !have.has(key(k)));
+  if (cur.items.length + fresh.length > 1000) throw new Error(`на аккаунт — не больше 1000 минус-слов (сейчас ${cur.items.length}, добавляется ${fresh.length})`);
+  const ops = [];
+  let set = cur.set?.resourceName;
+  if (!set) {
+    set = `customers/${cid}/sharedSets/-1`;
+    ops.push({ sharedSetOperation: { create: { resourceName: set, name: "Account negatives", type: "ACCOUNT_LEVEL_NEGATIVE_KEYWORDS" } } });
+  }
+  if (!cur.attached) ops.push({ customerNegativeCriterionOperation: { create: { negativeKeywordList: { sharedSet: set } } } });
+  for (const k of fresh) ops.push({ sharedCriterionOperation: { create: { sharedSet: set, keyword: { text: k.text, matchType: k.match } } } });
+  const res = fresh.length ? await mutate(env, cid, ops, args.apply, login) : { applied: false, changed: [] };
+  return { customer_id: cid, ...res, list: cur.set?.name || "Account negatives (новый)", added: fresh, already_there: wanted.filter((k) => have.has(key(k))) };
+}
+
+async function conversionTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const id = idOf(args.conversion_action_id, "conversion_action_id");
+  const fields = {};
+  if (args.phone_call_duration_seconds !== undefined) {
+    const s = Number(args.phone_call_duration_seconds);
+    if (!Number.isInteger(s) || s < 0 || s > 3600) throw new Error("phone_call_duration_seconds — целое 0…3600");
+    fields.phoneCallDurationSeconds = String(s);
+  }
+  if (args.primary_for_goal !== undefined) fields.primaryForGoal = Boolean(args.primary_for_goal);
+  if (!Object.keys(fields).length) throw new Error("Что менять: phone_call_duration_seconds и/или primary_for_goal");
+  const [row] = await gaql(env, cid, `SELECT conversion_action.resource_name, conversion_action.name, conversion_action.type, conversion_action.phone_call_duration_seconds, conversion_action.primary_for_goal FROM conversion_action WHERE conversion_action.id = ${id}`, login);
+  if (!row) throw new Error(`Конверсия ${id} не найдена`);
+  const a = row.conversionAction;
+  const res = await mutate(env, cid, [{ conversionActionOperation: { update: { resourceName: a.resourceName, ...fields }, updateMask: Object.keys(fields).join(",") } }], args.apply, login);
+  return {
+    customer_id: cid, ...res, conversion: a.name, type: a.type,
+    before: { phone_call_duration_seconds: Number(a.phoneCallDurationSeconds ?? 0), primary_for_goal: Boolean(a.primaryForGoal) },
+    after: { ...(fields.phoneCallDurationSeconds ? { phone_call_duration_seconds: Number(fields.phoneCallDurationSeconds) } : {}), ...("primaryForGoal" in fields ? { primary_for_goal: fields.primaryForGoal } : {}) },
+  };
+}
+
+async function campaignGoalTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const camp = idOf(args.campaign_id, "campaign_id");
+  const category = String(args.category || "").toUpperCase();
+  const origin = String(args.origin || "").toUpperCase();
+  if (!/^[A-Z_]+$/.test(category) || !/^[A-Z_]+$/.test(origin)) throw new Error("category / origin — как в Google Ads, напр. CONTACT / GOOGLE_HOSTED");
+  if (typeof args.biddable !== "boolean") throw new Error("biddable — true или false");
+  const resourceName = `customers/${cid}/campaignConversionGoals/${camp}~${category}~${origin}`;
+  const [row] = await gaql(env, cid, `SELECT campaign.name, campaign_conversion_goal.biddable FROM campaign_conversion_goal WHERE campaign_conversion_goal.resource_name = '${resourceName}'`, login);
+  if (!row) throw new Error(`У кампании ${camp} нет цели ${category} / ${origin}`);
+  const res = await mutate(env, cid, [{ campaignConversionGoalOperation: { update: { resourceName, biddable: args.biddable }, updateMask: "biddable" } }], args.apply, login);
+  return { customer_id: cid, ...res, campaign: row.campaign?.name, goal: `${category} / ${origin}`, before: Boolean(row.campaignConversionGoal?.biddable), after: args.biddable };
+}
+
+async function pinTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const id = idOf(args.ad_id, "ad_id");
+  const pos = String(args.position || "").toUpperCase();
+  if (!["HEADLINE_1", "HEADLINE_2", "HEADLINE_3", "NONE"].includes(pos)) throw new Error("position: HEADLINE_1, HEADLINE_2, HEADLINE_3 или NONE");
+  const texts = new Set((args.texts || []).map(String));
+  if (!texts.size) throw new Error("texts — заголовки для закрепления");
+  const [row] = await gaql(env, cid, `SELECT ad_group_ad.ad.resource_name, ad_group_ad.ad.type, ad_group_ad.ad.responsive_search_ad.headlines FROM ad_group_ad WHERE ad_group_ad.ad.id = ${id} LIMIT 1`, login);
+  const ad = row?.adGroupAd?.ad;
+  if (!ad) throw new Error(`Объявление ${id} не найдено`);
+  if (ad.type !== "RESPONSIVE_SEARCH_AD") throw new Error(`Объявление ${id} — не адаптивное поисковое (${ad.type})`);
+  const current = ad.responsiveSearchAd?.headlines || [];
+  const missing = [...texts].filter((t) => !current.some((h) => h.text === t));
+  if (missing.length) throw new Error(`Нет таких заголовков в объявлении: ${missing.join(" | ")}`);
+  // отправляем весь список (Google заменяет его целиком): тексты те же, меняется только закрепление выбранных
+  const headlines = current.map((h) => {
+    const pinned = texts.has(h.text) ? (pos === "NONE" ? undefined : pos) : h.pinnedField;
+    return pinned ? { text: h.text, pinnedField: pinned } : { text: h.text };
+  });
+  const res = await mutate(env, cid, [{ adOperation: { update: { resourceName: ad.resourceName, responsiveSearchAd: { headlines } }, updateMask: "responsiveSearchAd.headlines" } }], args.apply, login);
+  return { customer_id: cid, ...res, ad_id: id, headlines: headlines.map((h) => (h.pinnedField ? `${h.text}  [${h.pinnedField}]` : h.text)) };
+}
 
 export const GOOGLE_TOOLS = [
   {
@@ -230,13 +365,62 @@ export const GOOGLE_TOOLS = [
   },
   {
     name: "google_ads_request",
-    description: `Google Ads API ${VER}: запрос только на чтение — GET или POST к …:search / …:searchStream. Изменения (mutate) запрещены.`,
+    description: `Google Ads API ${VER}: запрос только на чтение — GET или POST к …:search / …:searchStream. Изменения (mutate) запрещены — для правок есть отдельные инструменты ниже.`,
     inputSchema: obj({
       method: { type: "string", enum: ["GET", "POST"], default: "POST" },
       path: { type: "string", description: "Путь после /v26, напр. /customers/1234567890/googleAds:search" },
       body: { type: "object", additionalProperties: true },
       ...LOGIN,
     }, ["path"]),
+  },
+  // ---- правки: узкий набор; без apply: true Google только проверяет запрос (validateOnly) и ничего не меняет ----
+  {
+    name: "google_ads_negative_keywords",
+    description: "Google Ads, ПРАВКА: минус-слова на уровне всего аккаунта (действуют на поиск и Performance Max). action=list — показать; add — добавить (список создаётся сам, дубли пропускаются); remove — убрать. Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      action: { type: "string", enum: ["list", "add", "remove"] },
+      keywords: { type: "array", description: "Слова: строка или {text, match}. match: PHRASE (по умолчанию), EXACT, BROAD", items: { anyOf: [{ type: "string" }, obj({ text: { type: "string" }, match: { type: "string", enum: MATCH } }, ["text"])] } },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["action"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "google_ads_conversion_update",
+    description: "Google Ads, ПРАВКА действия-конверсии: минимальная длительность звонка (сек), после которой он считается конверсией, и/или «основная» (участвует в ставках). Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      conversion_action_id: { type: "string" },
+      phone_call_duration_seconds: { type: "integer", description: "Для звонков: от скольких секунд считать конверсией" },
+      primary_for_goal: { type: "boolean" },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["conversion_action_id"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "google_ads_campaign_goal",
+    description: "Google Ads, ПРАВКА: участвует ли цель (категория + источник) в ставках конкретной кампании, напр. CONTACT + GOOGLE_HOSTED — «клики по кнопке звонка». Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      campaign_id: { type: "string" },
+      category: { type: "string", description: "Напр. CONTACT, PHONE_CALL_LEAD, PURCHASE, GET_DIRECTIONS" },
+      origin: { type: "string", description: "Напр. GOOGLE_HOSTED, CALL_FROM_ADS, WEBSITE" },
+      biddable: { type: "boolean" },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["campaign_id", "category", "origin", "biddable"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "google_ads_pin_headlines",
+    description: "Google Ads, ПРАВКА адаптивного поискового объявления: закрепить уже существующие заголовки на позицию (HEADLINE_1…3) или открепить (NONE). Тексты не меняются. Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      ad_id: { type: "string" },
+      texts: { type: "array", items: { type: "string" }, description: "Точные тексты заголовков из объявления" },
+      position: { type: "string", enum: ["HEADLINE_1", "HEADLINE_2", "HEADLINE_3", "NONE"] },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["ad_id", "texts", "position"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
   },
 ];
 
@@ -368,6 +552,15 @@ export async function googleTool(name, args, env) {
       if (method === "POST" ? !/:(search|searchStream)$/.test(path) : method !== "GET") throw new Error("Разрешено только чтение: GET или POST к …:search / …:searchStream");
       return call(env, path, { method, body: args.body, login: loginOf(args) });
     }
+
+    case "google_ads_negative_keywords":
+      return negativesTool(env, args);
+    case "google_ads_conversion_update":
+      return conversionTool(env, args);
+    case "google_ads_campaign_goal":
+      return campaignGoalTool(env, args);
+    case "google_ads_pin_headlines":
+      return pinTool(env, args);
 
     default:
       return undefined;

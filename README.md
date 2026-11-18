@@ -1,7 +1,7 @@
 # ads-mcp
 
 MCP-сервер рекламы на Cloudflare Workers: **Яндекс Директ (API v5)** + **VK Реклама (ads.vk.com)** +
-**Google Ads (API v26, только чтение)**. Протокол — JSON-RPC 2.0 поверх HTTP POST. Аутентификация — секрет в пути.
+**Google Ads (API v26: отчёты + узкий набор правок)**. Протокол — JSON-RPC 2.0 поверх HTTP POST. Аутентификация — секрет в пути.
 
 ## URL коннектора
 
@@ -29,7 +29,7 @@ https://ads-mcp.<аккаунт>.workers.dev/<MCP_SECRET>/mcp
 | `vk_ads_stats(metric?, ids?, date_from?, date_to?)` | Дневная статистика: показы, клики, расход |
 | `vk_ads_request(method, path, params?, body?)` | Универсальный вызов API |
 
-### Google Ads — только чтение
+### Google Ads
 
 | Инструмент | Назначение |
 |------------|------------|
@@ -42,6 +42,15 @@ https://ads-mcp.<аккаунт>.workers.dev/<MCP_SECRET>/mcp
 | `google_ads_conversions()` | Действия-конверсии и `send_to` (AW-…/метка) для тега на сайте |
 | `google_ads_search(query)` | Произвольный GAQL |
 | `google_ads_request(method, path, body?)` | GET или POST к `…:search`/`…:searchStream`; mutate запрещён |
+
+Правки — только эти четыре; без `apply: true` Google лишь проверяет запрос (validateOnly) и ничего не меняет:
+
+| Инструмент | Что меняет |
+|---|---|
+| `google_ads_negative_keywords(action, keywords?, apply?)` | Минус-слова всего аккаунта (поиск и Performance Max): `list` / `add` / `remove` |
+| `google_ads_conversion_update(conversion_action_id, phone_call_duration_seconds?, primary_for_goal?, apply?)` | С какой длительности звонок — конверсия; «основная» ли |
+| `google_ads_campaign_goal(campaign_id, category, origin, biddable, apply?)` | Участвует ли цель в ставках кампании |
+| `google_ads_pin_headlines(ad_id, texts, position, apply?)` | Закрепление существующих заголовков объявления (тексты не меняются) |
 
 Везде можно передать `customer_id` (иначе — аккаунт по умолчанию) и `login_customer_id` (доступ через MCC).
 

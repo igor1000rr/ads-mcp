@@ -1,5 +1,5 @@
 // ads-mcp — Cloudflare Worker
-// Реклама: Яндекс Директ (API v5) + VK Реклама (ads.vk.com) + Google Ads (API v26, только чтение — src/google.js).
+// Реклама: Яндекс Директ (API v5) + VK Реклама (ads.vk.com) + Google Ads (API v26: отчёты + узкий набор правок — src/google.js).
 // URL для коннектора: https://<worker>.workers.dev/<MCP_SECRET>/mcp
 // Подключение Google Ads: https://<worker>.workers.dev/<MCP_SECRET>/google
 // Секреты: MCP_SECRET,
