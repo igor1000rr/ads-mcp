@@ -331,11 +331,17 @@ async function budgetTool(env, args) {
   const [row] = await gaql(env, cid, `SELECT campaign.name, campaign_budget.resource_name, campaign_budget.amount_micros, campaign_budget.explicitly_shared, campaign_budget.reference_count FROM campaign WHERE campaign.id = ${camp}`, login);
   if (!row?.campaignBudget) throw new Error(`Кампания ${camp} не найдена`);
   const b = row.campaignBudget;
-  // общий бюджет поменяет и другие кампании — такое этим инструментом не трогаем
-  if (b.explicitlyShared || Number(b.referenceCount || 1) > 1) throw new Error(`У кампании «${row.campaign.name}» общий бюджет на ${b.referenceCount} кампаний — меняйте его в интерфейсе Google Ads`);
+  // общий бюджет меняет сразу все кампании на нём — только с явным shared: true
+  const isShared = b.explicitlyShared || Number(b.referenceCount || 1) > 1;
+  let sharedWith;
+  if (isShared) {
+    if (args.shared !== true) throw new Error(`У кампании «${row.campaign.name}» общий бюджет на ${b.referenceCount} кампаний — чтобы изменить его для всех, передайте shared: true`);
+    const rows = await gaql(env, cid, `SELECT campaign.name FROM campaign WHERE campaign.campaign_budget = '${b.resourceName}' AND campaign.status != 'REMOVED'`, login);
+    sharedWith = rows.map((r) => r.campaign.name);
+  }
   const micros = String(Math.round(amount * 100) * 10000);
   const res = await mutate(env, cid, [{ campaignBudgetOperation: { update: { resourceName: b.resourceName, amountMicros: micros }, updateMask: "amount_micros" } }], args.apply, login);
-  return { customer_id: cid, ...res, campaign: row.campaign.name, before: money(b.amountMicros), after: money(micros) };
+  return { customer_id: cid, ...res, campaign: row.campaign.name, ...(sharedWith ? { shared_with: sharedWith } : {}), before: money(b.amountMicros), after: money(micros) };
 }
 
 async function keywordMatchTool(env, args) {
@@ -475,11 +481,12 @@ export const GOOGLE_TOOLS = [
   },
   {
     name: "google_ads_campaign_budget",
-    description: "Google Ads, ПРАВКА: дневной бюджет кампании (в валюте аккаунта). Общие бюджеты на несколько кампаний не трогает. Без apply: true — только проверка.",
+    description: "Google Ads, ПРАВКА: дневной бюджет кампании (в валюте аккаунта). Общий бюджет на несколько кампаний меняется только с shared: true (сразу для всех). Без apply: true — только проверка.",
     inputSchema: obj({
       ...CID, ...LOGIN,
       campaign_id: { type: "string" },
       daily_budget: { type: "number", description: "Новый бюджет в день, напр. 60" },
+      shared: { type: "boolean", description: "true — разрешить правку общего бюджета (изменится у всех кампаний на нём)" },
       apply: { type: "boolean", description: "true — применить; иначе только проверка" },
     }, ["campaign_id", "daily_budget"]),
     annotations: { readOnlyHint: false, destructiveHint: false },
