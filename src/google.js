@@ -190,7 +190,8 @@ const obj = (properties, required) => ({ type: "object", properties, ...(require
 const MATCH = ["PHRASE", "EXACT", "BROAD"];
 
 // ---------- правки ----------
-// Только то, что ниже: минус-слова аккаунта, настройки конверсии, цели кампании, закрепление заголовков.
+// Только то, что ниже: минус-слова аккаунта и кампании, настройки и создание конверсии, цели кампании, бюджет, соответствие
+// ключевых слов, места показа, тексты и ссылки объявлений, быстрые ссылки и уточнения. Удаления кампаний, групп и объявлений нет.
 // Всё одной атомарной пачкой через googleAds:mutate; без apply — validateOnly (Google проверяет, ничего не меняя).
 
 async function mutate(env, cid, ops, apply, login) {
@@ -379,6 +380,291 @@ async function keywordMatchTool(env, args) {
   return { customer_id: cid, ...res, campaign_id: camp, switched: out };
 }
 
+// ---- места показа, минус-слова кампании, тексты и ссылки объявлений, расширения, новая конверсия ----
+
+const bare = (h) => String(h || "").toLowerCase().replace(/^www\./, "");
+const len = (t) => [...String(t)].length;
+
+// хосты сайта рекламодателя — из ссылок включённых объявлений и групп объектов; новые ссылки только на них
+async function ownHosts(env, cid, login) {
+  const ads = await gaql(env, cid, "SELECT ad_group_ad.ad.final_urls FROM ad_group_ad WHERE ad_group_ad.status = 'ENABLED' AND campaign.status = 'ENABLED'", login);
+  const groups = await gaql(env, cid, "SELECT asset_group.final_urls FROM asset_group WHERE asset_group.status = 'ENABLED' AND campaign.status = 'ENABLED'", login);
+  const hosts = new Set();
+  for (const u of [...ads.flatMap((r) => r.adGroupAd?.ad?.finalUrls || []), ...groups.flatMap((r) => r.assetGroup?.finalUrls || [])]) {
+    try { hosts.add(bare(new URL(u).host)); } catch { /* битая ссылка — пропускаем */ }
+  }
+  return hosts;
+}
+
+async function siteUrl(env, cid, login, u, hosts) {
+  let x;
+  try { x = new URL(String(u || "")); } catch { throw new Error(`«${u}» — не ссылка`); }
+  if (x.protocol !== "https:" || x.username || x.password) throw new Error(`«${u}» — нужна ссылка https без логина`);
+  const own = hosts || (await ownHosts(env, cid, login));
+  if (!own.has(bare(x.host))) throw new Error(`«${u}» — не на сайте рекламодателя (${[...own].join(", ") || "нет включённых объявлений"})`);
+  return x.toString();
+}
+
+async function geoTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const camp = idOf(args.campaign_id, "campaign_id");
+  const rows = await gaql(env, cid, `SELECT campaign.id, campaign_criterion.resource_name, campaign_criterion.negative, campaign_criterion.location.geo_target_constant FROM campaign_criterion WHERE campaign.id = ${camp} AND campaign_criterion.type = 'LOCATION'`, login);
+  const cur = rows.map((r) => ({ res: r.campaignCriterion.resourceName, geo: r.campaignCriterion.location.geoTargetConstant.split("/").pop(), negative: Boolean(r.campaignCriterion.negative) }));
+  const ids = [...new Set((args.location_ids || []).map((v) => idOf(v, "location_ids")))];
+  const all = [...new Set([...ids, ...cur.map((c) => c.geo)])];
+  const names = new Map(all.length
+    ? (await gaql(env, cid, `SELECT geo_target_constant.id, geo_target_constant.canonical_name, geo_target_constant.status FROM geo_target_constant WHERE geo_target_constant.id IN (${all.join(",")})`, login)).map((g) => [String(g.geoTargetConstant.id), g.geoTargetConstant])
+    : []);
+  const view = (list) => list.map((c) => ({ id: c.geo, name: names.get(c.geo)?.canonicalName || null, negative: c.negative }));
+  if (args.action === "list") return { customer_id: cid, campaign_id: camp, locations: view(cur) };
+
+  if (!ids.length) throw new Error("location_ids — ID мест (geo_target_constant), напр. 1011475 — Гданьск");
+  const unknown = ids.filter((id) => names.get(id)?.status !== "ENABLED");
+  if (unknown.length) throw new Error(`Нет таких мест: ${unknown.join(", ")}`);
+  const negative = Boolean(args.negative);
+  const removes = [];
+  const creates = [];
+  let after = cur.slice();
+  if (args.action === "add") {
+    for (const id of ids) {
+      const same = cur.find((c) => c.geo === id);
+      if (same && same.negative === negative) continue;
+      // было с другим знаком (исключено ↔ показ) — сначала убираем старое условие
+      if (same) { removes.push({ campaignCriterionOperation: { remove: same.res } }); after = after.filter((c) => c !== same); }
+      creates.push({ campaignCriterionOperation: { create: { campaign: `customers/${cid}/campaigns/${camp}`, negative, location: { geoTargetConstant: `geoTargetConstants/${id}` } } } });
+      after.push({ geo: id, negative });
+    }
+  } else if (args.action === "remove") {
+    for (const id of ids) {
+      const same = cur.find((c) => c.geo === id && c.negative === negative);
+      if (same) { removes.push({ campaignCriterionOperation: { remove: same.res } }); after = after.filter((c) => c !== same); }
+    }
+  } else throw new Error("action: list, add, remove");
+  if (!after.some((c) => !c.negative)) throw new Error("После правки у кампании не останется ни одного места показа — реклама пошла бы по всему миру. Ничего не изменено.");
+  const res = await mutate(env, cid, [...removes, ...creates], args.apply, login);
+  return { customer_id: cid, campaign_id: camp, ...res, before: view(cur), after: view(after) };
+}
+
+async function campaignNegativesTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const camp = idOf(args.campaign_id, "campaign_id");
+  const rows = await gaql(env, cid, `SELECT campaign.id, campaign_criterion.resource_name, campaign_criterion.keyword.text, campaign_criterion.keyword.match_type FROM campaign_criterion WHERE campaign.id = ${camp} AND campaign_criterion.type = 'KEYWORD' AND campaign_criterion.negative = TRUE`, login);
+  const cur = rows.map((r) => ({ resource: r.campaignCriterion.resourceName, text: r.campaignCriterion.keyword?.text, match: r.campaignCriterion.keyword?.matchType })).filter((k) => k.text);
+  const key = (k) => `${k.match}|${k.text.toLowerCase()}`;
+  if (args.action === "list") {
+    const q = String(args.contains || "").trim().toLowerCase();
+    const list = q ? cur.filter((k) => k.text.toLowerCase().includes(q)) : cur;
+    return { customer_id: cid, campaign_id: camp, count: cur.length, ...(q ? { matching: list.length } : {}), keywords: list.slice(0, 500).map(({ text, match }) => ({ text, match })) };
+  }
+  const wanted = [...new Map((args.keywords || []).map(negativeOf).map((k) => [key(k), k])).values()];
+  if (!wanted.length) throw new Error("keywords — список минус-слов");
+  const have = new Map(cur.map((k) => [key(k), k]));
+  if (args.action === "remove") {
+    const found = wanted.filter((k) => have.has(key(k)));
+    const res = await mutate(env, cid, found.map((k) => ({ campaignCriterionOperation: { remove: have.get(key(k)).resource } })), args.apply, login);
+    return { customer_id: cid, campaign_id: camp, ...res, removed: found, not_found: wanted.filter((k) => !have.has(key(k))) };
+  }
+  if (args.action !== "add") throw new Error("action: list, add, remove");
+  const fresh = wanted.filter((k) => !have.has(key(k)));
+  const res = await mutate(env, cid, fresh.map((k) => ({ campaignCriterionOperation: { create: { campaign: `customers/${cid}/campaigns/${camp}`, negative: true, keyword: { text: k.text, matchType: k.match } } } })), args.apply, login);
+  return { customer_id: cid, campaign_id: camp, ...res, added: fresh, already_there: wanted.filter((k) => have.has(key(k))) };
+}
+
+async function adEditTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const id = idOf(args.ad_id, "ad_id");
+  const [row] = await gaql(env, cid, `SELECT ad_group_ad.ad.resource_name, ad_group_ad.ad.type, ad_group_ad.ad.responsive_search_ad.headlines, ad_group_ad.ad.responsive_search_ad.descriptions FROM ad_group_ad WHERE ad_group_ad.ad.id = ${id} LIMIT 1`, login);
+  const ad = row?.adGroupAd?.ad;
+  if (!ad) throw new Error(`Объявление ${id} не найдено`);
+  if (ad.type !== "RESPONSIVE_SEARCH_AD") throw new Error(`Объявление ${id} — не адаптивное поисковое (${ad.type})`);
+  const pick = (list) => (list || []).map((t) => (t.pinnedField ? { text: t.text, pinnedField: t.pinnedField } : { text: t.text }));
+  const before = { headlines: pick(ad.responsiveSearchAd?.headlines), descriptions: pick(ad.responsiveSearchAd?.descriptions) };
+  const hl = before.headlines.map((t) => ({ ...t }));
+  const ds = before.descriptions.map((t) => ({ ...t }));
+  const where = (text) => (hl.find((t) => t.text === text) ? hl : ds.find((t) => t.text === text) ? ds : null);
+  const fresh = [];
+  for (const r of args.replace || []) {
+    const list = where(String(r?.from ?? ""));
+    if (!list) throw new Error(`Нет такого текста в объявлении: «${r?.from}»`);
+    const item = list.find((t) => t.text === r.from);
+    item.text = String(r.to ?? "").trim();
+    fresh.push({ text: item.text, kind: list === hl ? "headline" : "description" });
+  }
+  for (const text of args.remove || []) {
+    const list = where(String(text));
+    if (!list) throw new Error(`Нет такого текста в объявлении: «${text}»`);
+    list.splice(list.findIndex((t) => t.text === text), 1);
+  }
+  for (const text of args.add_headlines || []) { hl.push({ text: String(text).trim() }); fresh.push({ text: String(text).trim(), kind: "headline" }); }
+  for (const text of args.add_descriptions || []) { ds.push({ text: String(text).trim() }); fresh.push({ text: String(text).trim(), kind: "description" }); }
+  for (const f of fresh) {
+    const max = f.kind === "headline" ? 30 : 90;
+    if (!f.text) throw new Error("Пустой текст");
+    if (!f.text.includes("{") && len(f.text) > max) throw new Error(`«${f.text}» — ${len(f.text)} знаков, для ${f.kind === "headline" ? "заголовка" : "описания"} максимум ${max}`);
+  }
+  const dup = (list) => list.map((t) => t.text.toLowerCase()).find((t, i, a) => a.indexOf(t) !== i);
+  if (dup(hl) || dup(ds)) throw new Error(`Повтор текста: «${dup(hl) || dup(ds)}»`);
+  if (hl.length < 3 || hl.length > 15) throw new Error(`Заголовков должно быть 3–15, выходит ${hl.length}`);
+  if (ds.length < 2 || ds.length > 4) throw new Error(`Описаний должно быть 2–4, выходит ${ds.length}`);
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const rsa = {};
+  const mask = [];
+  if (!same(hl, before.headlines)) { rsa.headlines = hl; mask.push("responsiveSearchAd.headlines"); }
+  if (!same(ds, before.descriptions)) { rsa.descriptions = ds; mask.push("responsiveSearchAd.descriptions"); }
+  if (!mask.length) throw new Error("Нечего менять: replace, remove, add_headlines, add_descriptions");
+  const res = await mutate(env, cid, [{ adOperation: { update: { resourceName: ad.resourceName, responsiveSearchAd: rsa }, updateMask: mask.join(",") } }], args.apply, login);
+  const show = (list) => list.map((t) => (t.pinnedField ? `${t.text}  [${t.pinnedField}]` : t.text));
+  return { customer_id: cid, ad_id: id, ...res, headlines: show(hl), descriptions: show(ds) };
+}
+
+async function finalUrlTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const which = ["ad_id", "asset_group_id", "asset_id"].filter((k) => args[k]);
+  if (which.length !== 1) throw new Error("Укажите что-то одно: ad_id, asset_group_id или asset_id (ссылка расширения)");
+  const url = await siteUrl(env, cid, login, args.final_url);
+  let op;
+  let before;
+  let what;
+  if (args.ad_id) {
+    const id = idOf(args.ad_id, "ad_id");
+    const [row] = await gaql(env, cid, `SELECT ad_group_ad.ad.resource_name, ad_group_ad.ad.final_urls FROM ad_group_ad WHERE ad_group_ad.ad.id = ${id} LIMIT 1`, login);
+    const ad = row?.adGroupAd?.ad;
+    if (!ad) throw new Error(`Объявление ${id} не найдено`);
+    before = ad.finalUrls || [];
+    what = `объявление ${id}`;
+    op = { adOperation: { update: { resourceName: ad.resourceName, finalUrls: [url] }, updateMask: "finalUrls" } };
+  } else if (args.asset_group_id) {
+    const id = idOf(args.asset_group_id, "asset_group_id");
+    const [row] = await gaql(env, cid, `SELECT asset_group.resource_name, asset_group.name, asset_group.final_urls FROM asset_group WHERE asset_group.id = ${id}`, login);
+    if (!row) throw new Error(`Группа объектов ${id} не найдена`);
+    before = row.assetGroup.finalUrls || [];
+    what = `группа объектов «${row.assetGroup.name}»`;
+    op = { assetGroupOperation: { update: { resourceName: row.assetGroup.resourceName, finalUrls: [url] }, updateMask: "finalUrls" } };
+  } else {
+    const id = idOf(args.asset_id, "asset_id");
+    const [row] = await gaql(env, cid, `SELECT asset.resource_name, asset.type, asset.final_urls, asset.sitelink_asset.link_text, asset.promotion_asset.promotion_target FROM asset WHERE asset.id = ${id}`, login);
+    if (!row) throw new Error(`Объект ${id} не найден`);
+    const a = row.asset;
+    if (!["SITELINK", "PROMOTION"].includes(a.type)) throw new Error(`Объект ${id} — ${a.type}; ссылку меняю только у быстрых ссылок и промоакций`);
+    before = a.finalUrls || [];
+    what = `${a.type === "SITELINK" ? "быстрая ссылка" : "промоакция"} «${a.sitelinkAsset?.linkText || a.promotionAsset?.promotionTarget}»`;
+    op = { assetOperation: { update: { resourceName: a.resourceName, finalUrls: [url] }, updateMask: "finalUrls" } };
+  }
+  const res = await mutate(env, cid, [op], args.apply, login);
+  return { customer_id: cid, ...res, target: what, before, after: [url] };
+}
+
+const ASSET_FIELDS = ["SITELINK", "CALLOUT", "PROMOTION", "PRICE", "STRUCTURED_SNIPPET", "CALL"];
+
+async function assetsTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const action = args.action;
+  const camps = [...new Set((args.campaign_ids || []).map((v) => idOf(v, "campaign_ids")))];
+  const fields = ASSET_FIELDS.map((f) => `'${f}'`).join(", ");
+  const linked = async () => {
+    const c = await gaql(env, cid, `SELECT campaign.id, campaign.name, campaign_asset.field_type, campaign_asset.status, asset.id, asset.final_urls, asset.sitelink_asset.link_text, asset.callout_asset.callout_text, asset.promotion_asset.promotion_target FROM campaign_asset WHERE campaign.status = 'ENABLED' AND campaign_asset.status != 'REMOVED' AND campaign_asset.field_type IN (${fields})`, login);
+    const a = await gaql(env, cid, `SELECT customer_asset.field_type, customer_asset.status, asset.id, asset.final_urls, asset.sitelink_asset.link_text, asset.callout_asset.callout_text, asset.promotion_asset.promotion_target FROM customer_asset WHERE customer_asset.status != 'REMOVED' AND customer_asset.field_type IN (${fields})`, login);
+    const text = (x) => x.sitelinkAsset?.linkText || x.calloutAsset?.calloutText || x.promotionAsset?.promotionTarget || null;
+    return [
+      ...a.map((r) => ({ level: "account", campaign_id: null, campaign: null, field: r.customerAsset.fieldType, status: r.customerAsset.status, asset_id: String(r.asset.id), text: text(r.asset), url: r.asset.finalUrls?.[0] || null })),
+      ...c.map((r) => ({ level: "campaign", campaign_id: String(r.campaign.id), campaign: r.campaign.name, field: r.campaignAsset.fieldType, status: r.campaignAsset.status, asset_id: String(r.asset.id), text: text(r.asset), url: r.asset.finalUrls?.[0] || null })),
+    ];
+  };
+  if (action === "list") return { customer_id: cid, assets: await linked() };
+
+  if (action === "unlink") {
+    const asset = idOf(args.asset_id, "asset_id");
+    const field = String(args.field_type || "").toUpperCase();
+    if (!ASSET_FIELDS.includes(field)) throw new Error(`field_type: ${ASSET_FIELDS.join(", ")}`);
+    const now = (await linked()).filter((l) => l.asset_id === asset && l.field === field);
+    const hits = args.account ? now.filter((l) => l.level === "account") : now.filter((l) => l.level === "campaign" && (!camps.length || camps.includes(l.campaign_id)));
+    if (!hits.length) throw new Error(`Объект ${asset} (${field}) ${args.account ? "не подключён к аккаунту" : "не подключён к этим кампаниям"}`);
+    const ops = hits.map((l) => (l.level === "account"
+      ? { customerAssetOperation: { remove: `customers/${cid}/customerAssets/${asset}~${field}` } }
+      : { campaignAssetOperation: { remove: `customers/${cid}/campaignAssets/${l.campaign_id}~${asset}~${field}` } }));
+    const res = await mutate(env, cid, ops, args.apply, login);
+    return { customer_id: cid, ...res, unlinked: hits.map(({ level, campaign, text }) => ({ level, campaign, text })), note: "Сам объект не удаляется — его можно подключить обратно в Google Ads" };
+  }
+
+  if (action !== "add_callouts" && action !== "add_sitelinks") throw new Error("action: list, unlink, add_callouts, add_sitelinks");
+  if (!camps.length) throw new Error("campaign_ids — к каким кампаниям подключить");
+  const names = new Map((await gaql(env, cid, `SELECT campaign.id, campaign.name FROM campaign WHERE campaign.id IN (${camps.join(",")}) AND campaign.status != 'REMOVED'`, login)).map((r) => [String(r.campaign.id), r.campaign.name]));
+  const missing = camps.filter((c) => !names.has(c));
+  if (missing.length) throw new Error(`Нет таких кампаний: ${missing.join(", ")}`);
+  const field = action === "add_callouts" ? "CALLOUT" : "SITELINK";
+  const items = action === "add_callouts"
+    ? (args.callouts || []).map((t) => ({ text: String(t).trim() }))
+    : (args.sitelinks || []).map((s) => ({ text: String(s?.text || "").trim(), url: s?.url, d1: String(s?.description1 || "").trim(), d2: String(s?.description2 || "").trim() }));
+  if (!items.length) throw new Error(action === "add_callouts" ? "callouts — тексты уточнений" : "sitelinks — [{text, url, description1?, description2?}]");
+  const hosts = field === "SITELINK" ? await ownHosts(env, cid, login) : null;
+  for (const it of items) {
+    if (!it.text || len(it.text) > 25) throw new Error(`«${it.text}» — нужно 1–25 знаков`);
+    if (field === "SITELINK") {
+      it.url = await siteUrl(env, cid, login, it.url, hosts);
+      if (Boolean(it.d1) !== Boolean(it.d2)) throw new Error(`«${it.text}»: описания — обе строки или ни одной`);
+      for (const d of [it.d1, it.d2]) if (d && len(d) > 35) throw new Error(`«${d}» — максимум 35 знаков`);
+    }
+  }
+  const already = await linked();
+  const ops = [];
+  const out = [];
+  let tmp = 0;
+  for (const it of items) {
+    // уже есть такой же объект с тем же текстом — подключаем его, а не плодим копии
+    const twin = already.find((l) => l.field === field && l.text === it.text && (field === "CALLOUT" || l.url === it.url));
+    let asset = twin ? `customers/${cid}/assets/${twin.asset_id}` : null;
+    if (!asset) {
+      asset = `customers/${cid}/assets/-${++tmp}`;
+      const create = field === "CALLOUT"
+        ? { resourceName: asset, calloutAsset: { calloutText: it.text } }
+        : { resourceName: asset, finalUrls: [it.url], sitelinkAsset: { linkText: it.text, ...(it.d1 ? { description1: it.d1, description2: it.d2 } : {}) } };
+      ops.push({ assetOperation: { create } });
+    }
+    for (const c of camps) {
+      const on = twin && already.some((l) => l.level === "campaign" && l.campaign_id === c && l.asset_id === twin.asset_id && l.field === field);
+      if (on) { out.push({ text: it.text, campaign: names.get(c), result: "уже подключено" }); continue; }
+      ops.push({ campaignAssetOperation: { create: { campaign: `customers/${cid}/campaigns/${c}`, asset, fieldType: field } } });
+      out.push({ text: it.text, campaign: names.get(c), result: twin ? "подключено существующее" : "новое" });
+    }
+  }
+  const res = await mutate(env, cid, ops, args.apply, login);
+  return { customer_id: cid, ...res, items: out };
+}
+
+async function conversionCreateTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const name = String(args.name || "").trim();
+  if (!name || len(name) > 100) throw new Error("name — 1–100 знаков");
+  const category = String(args.category || "PURCHASE").toUpperCase();
+  if (!["PURCHASE", "ADD_TO_CART", "BEGIN_CHECKOUT", "SUBMIT_LEAD_FORM", "CONTACT", "SIGNUP"].includes(category)) throw new Error("category: PURCHASE, ADD_TO_CART, BEGIN_CHECKOUT, SUBMIT_LEAD_FORM, CONTACT, SIGNUP");
+  const value = args.default_value === undefined ? 0 : Number(args.default_value);
+  if (!Number.isFinite(value) || value < 0 || value > 100000) throw new Error("default_value — 0…100000");
+  const [acc] = await gaql(env, cid, "SELECT customer.currency_code FROM customer LIMIT 1", login);
+  const quoted = name.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const [twin] = await gaql(env, cid, `SELECT conversion_action.id, conversion_action.status FROM conversion_action WHERE conversion_action.name = '${quoted}' AND conversion_action.status != 'REMOVED'`, login);
+  if (twin) throw new Error(`Конверсия «${name}» уже есть (id ${twin.conversionAction.id})`);
+  const create = {
+    name, type: "WEBPAGE", category, status: "ENABLED",
+    primaryForGoal: args.primary_for_goal === true,
+    countingType: category === "PURCHASE" ? "MANY_PER_CLICK" : "ONE_PER_CLICK",
+    valueSettings: { defaultValue: value, defaultCurrencyCode: acc?.customer?.currencyCode || "PLN", alwaysUseDefaultValue: false },
+    clickThroughLookbackWindowDays: 30, viewThroughLookbackWindowDays: 1,
+  };
+  const res = await mutate(env, cid, [{ conversionActionOperation: { create } }], args.apply, login);
+  if (!res.applied) return { customer_id: cid, ...res, will_create: create };
+  const id = res.changed[0]?.split("/").pop();
+  const [row] = await gaql(env, cid, `SELECT conversion_action.id, conversion_action.tag_snippets FROM conversion_action WHERE conversion_action.id = ${id}`, login);
+  const snippet = (row?.conversionAction?.tagSnippets || []).map((t) => t.eventSnippet || "").join("\n");
+  const sendTo = [...new Set([...snippet.matchAll(/send_to['"]?\s*:\s*['"]([^'"]+)['"]/g)].map((m) => m[1]))];
+  return { customer_id: cid, ...res, conversion_action_id: id, name, primary_for_goal: create.primaryForGoal, send_to: sendTo };
+}
+
 export const GOOGLE_TOOLS = [
   {
     name: "google_ads_status",
@@ -501,6 +787,88 @@ export const GOOGLE_TOOLS = [
       to_match: { type: "string", enum: ["PHRASE", "EXACT"], description: "По умолчанию PHRASE" },
       apply: { type: "boolean", description: "true — применить; иначе только проверка" },
     }, ["campaign_id"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "google_ads_geo",
+    description: "Google Ads, ПРАВКА мест показа кампании: action=list — показать; add — добавить место в показ (negative: false) или в исключения (negative: true), если оно было с другим знаком — переносится; remove — убрать условие. ID мест — geo_target_constant (через google_ads_search). Кампанию без единого места показа не оставляет. Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      campaign_id: { type: "string" },
+      action: { type: "string", enum: ["list", "add", "remove"] },
+      location_ids: { type: "array", items: { type: "string" }, description: "ID мест, напр. 1011475 (Гданьск)" },
+      negative: { type: "boolean", description: "true — исключение; по умолчанию показ" },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["campaign_id", "action"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "google_ads_campaign_negatives",
+    description: "Google Ads, ПРАВКА минус-слов одной кампании (в т.ч. Performance Max): action=list (contains — фильтр), add, remove. Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      campaign_id: { type: "string" },
+      action: { type: "string", enum: ["list", "add", "remove"] },
+      contains: { type: "string", description: "Для list: только слова, содержащие этот текст" },
+      keywords: { type: "array", description: "Слова: строка или {text, match}. match: PHRASE (по умолчанию), EXACT, BROAD", items: { anyOf: [{ type: "string" }, obj({ text: { type: "string" }, match: { type: "string", enum: MATCH } }, ["text"])] } },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["campaign_id", "action"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "google_ads_ad_edit",
+    description: "Google Ads, ПРАВКА текстов адаптивного поискового объявления: replace [{from, to}] — заменить заголовок или описание (закрепление сохраняется), remove — убрать тексты, add_headlines / add_descriptions — добавить. Заголовок до 30 знаков, описание до 90; заголовков 3–15, описаний 2–4. Объявление уходит на повторную проверку Google. Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      ad_id: { type: "string" },
+      replace: { type: "array", items: obj({ from: { type: "string" }, to: { type: "string" } }, ["from", "to"]) },
+      remove: { type: "array", items: { type: "string" } },
+      add_headlines: { type: "array", items: { type: "string" } },
+      add_descriptions: { type: "array", items: { type: "string" } },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["ad_id"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "google_ads_final_url",
+    description: "Google Ads, ПРАВКА конечной ссылки: объявления (ad_id), группы объектов Performance Max (asset_group_id) или быстрой ссылки / промоакции (asset_id). Только https и только на сайт, куда уже ведут включённые объявления. Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      ad_id: { type: "string" },
+      asset_group_id: { type: "string" },
+      asset_id: { type: "string" },
+      final_url: { type: "string" },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["final_url"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "google_ads_assets",
+    description: "Google Ads, ПРАВКА расширений: action=list — быстрые ссылки, уточнения, промоакции, прайс-листы, структурированные описания и звонки (аккаунт и включённые кампании); unlink — отключить объект (asset_id + field_type) от кампаний campaign_ids (пусто — от всех) или от аккаунта (account: true), сам объект остаётся; add_callouts — уточнения (до 25 знаков) к кампаниям; add_sitelinks — быстрые ссылки [{text до 25, url, description1/2 до 35}] к кампаниям. Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      action: { type: "string", enum: ["list", "unlink", "add_callouts", "add_sitelinks"] },
+      asset_id: { type: "string" },
+      field_type: { type: "string", enum: ["SITELINK", "CALLOUT", "PROMOTION", "PRICE", "STRUCTURED_SNIPPET", "CALL"] },
+      account: { type: "boolean", description: "unlink: отключить от аккаунта (а не от кампаний)" },
+      campaign_ids: { type: "array", items: { type: "string" } },
+      callouts: { type: "array", items: { type: "string" } },
+      sitelinks: { type: "array", items: obj({ text: { type: "string" }, url: { type: "string" }, description1: { type: "string" }, description2: { type: "string" } }, ["text", "url"]) },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["action"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "google_ads_conversion_create",
+    description: "Google Ads, ПРАВКА: новое действие-конверсия для тега на сайте (тип WEBPAGE), по умолчанию «Покупка», не основная (не влияет на ставки, пока не включить primary). После apply возвращает send_to (AW-…/метка). Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      name: { type: "string" },
+      category: { type: "string", enum: ["PURCHASE", "ADD_TO_CART", "BEGIN_CHECKOUT", "SUBMIT_LEAD_FORM", "CONTACT", "SIGNUP"] },
+      default_value: { type: "number", description: "Ценность, если сайт не передал сумму (по умолчанию 0)" },
+      primary_for_goal: { type: "boolean", description: "По умолчанию false" },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["name"]),
     annotations: { readOnlyHint: false, destructiveHint: false },
   },
 ];
@@ -646,6 +1014,18 @@ export async function googleTool(name, args, env) {
       return budgetTool(env, args);
     case "google_ads_keyword_match":
       return keywordMatchTool(env, args);
+    case "google_ads_geo":
+      return geoTool(env, args);
+    case "google_ads_campaign_negatives":
+      return campaignNegativesTool(env, args);
+    case "google_ads_ad_edit":
+      return adEditTool(env, args);
+    case "google_ads_final_url":
+      return finalUrlTool(env, args);
+    case "google_ads_assets":
+      return assetsTool(env, args);
+    case "google_ads_conversion_create":
+      return conversionCreateTool(env, args);
 
     default:
       return undefined;

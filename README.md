@@ -53,6 +53,12 @@ https://ads-mcp.<аккаунт>.workers.dev/<MCP_SECRET>/mcp
 | `google_ads_pin_headlines(ad_id, texts, position, apply?)` | Закрепление существующих заголовков объявления (тексты не меняются) |
 | `google_ads_campaign_budget(campaign_id, daily_budget, shared?, apply?)` | Дневной бюджет кампании; общий бюджет — только с `shared: true` |
 | `google_ads_keyword_match(campaign_id, keywords?, to_match?, apply?)` | Широкие слова → фразовые/точные: копия с новым типом, старое на паузу |
+| `google_ads_geo(campaign_id, action, location_ids?, negative?, apply?)` | Места показа и исключения кампании; без единого места показа кампанию не оставляет |
+| `google_ads_campaign_negatives(campaign_id, action, keywords?, contains?, apply?)` | Минус-слова одной кампании (и Performance Max) |
+| `google_ads_ad_edit(ad_id, replace?, remove?, add_headlines?, add_descriptions?, apply?)` | Тексты адаптивного поискового объявления; закрепление сохраняется |
+| `google_ads_final_url(ad_id \| asset_group_id \| asset_id, final_url, apply?)` | Конечная ссылка объявления, группы объектов PMax, быстрой ссылки или промоакции — только на свой сайт |
+| `google_ads_assets(action, …, apply?)` | Расширения: `list`, `unlink` (объект остаётся), `add_callouts`, `add_sitelinks` |
+| `google_ads_conversion_create(name, category?, default_value?, primary_for_goal?, apply?)` | Новая конверсия для тега на сайте, по умолчанию не основная; возвращает `send_to` |
 
 Везде можно передать `customer_id` (иначе — аккаунт по умолчанию) и `login_customer_id` (доступ через MCC).
 
