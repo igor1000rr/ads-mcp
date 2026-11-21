@@ -567,7 +567,7 @@ async function assetsTool(env, args) {
   const camps = [...new Set((args.campaign_ids || []).map((v) => idOf(v, "campaign_ids")))];
   const fields = ASSET_FIELDS.map((f) => `'${f}'`).join(", ");
   const linked = async () => {
-    const c = await gaql(env, cid, `SELECT campaign.id, campaign.name, campaign_asset.field_type, campaign_asset.status, asset.id, asset.final_urls, asset.sitelink_asset.link_text, asset.callout_asset.callout_text, asset.promotion_asset.promotion_target FROM campaign_asset WHERE campaign.status = 'ENABLED' AND campaign_asset.status != 'REMOVED' AND campaign_asset.field_type IN (${fields})`, login);
+    const c = await gaql(env, cid, `SELECT campaign.id, campaign.name, campaign.status, campaign_asset.field_type, campaign_asset.status, asset.id, asset.final_urls, asset.sitelink_asset.link_text, asset.callout_asset.callout_text, asset.promotion_asset.promotion_target FROM campaign_asset WHERE campaign.status = 'ENABLED' AND campaign_asset.status != 'REMOVED' AND campaign_asset.field_type IN (${fields})`, login);
     const a = await gaql(env, cid, `SELECT customer_asset.field_type, customer_asset.status, asset.id, asset.final_urls, asset.sitelink_asset.link_text, asset.callout_asset.callout_text, asset.promotion_asset.promotion_target FROM customer_asset WHERE customer_asset.status != 'REMOVED' AND customer_asset.field_type IN (${fields})`, login);
     const text = (x) => x.sitelinkAsset?.linkText || x.calloutAsset?.calloutText || x.promotionAsset?.promotionTarget || null;
     return [
