@@ -57,7 +57,7 @@ https://ads-mcp.<аккаунт>.workers.dev/<MCP_SECRET>/mcp
 | `google_ads_campaign_negatives(campaign_id, action, keywords?, contains?, apply?)` | Минус-слова одной кампании (и Performance Max) |
 | `google_ads_ad_edit(ad_id, replace?, remove?, add_headlines?, add_descriptions?, apply?)` | Тексты адаптивного поискового объявления; закрепление сохраняется |
 | `google_ads_final_url(ad_id \| asset_group_id \| asset_id, final_url, apply?)` | Конечная ссылка объявления, группы объектов PMax, быстрой ссылки или промоакции — только на свой сайт |
-| `google_ads_assets(action, …, apply?)` | Расширения: `list`, `unlink` (объект остаётся), `add_callouts`, `add_sitelinks` |
+| `google_ads_assets(action, …, apply?)` | Расширения: `list`, `unlink` (объект остаётся; с `asset_group_id` — текст Performance Max), `add_callouts`, `add_sitelinks` |
 | `google_ads_conversion_create(name, category?, default_value?, primary_for_goal?, apply?)` | Новая конверсия для тега на сайте, по умолчанию не основная; возвращает `send_to` |
 
 Везде можно передать `customer_id` (иначе — аккаунт по умолчанию) и `login_customer_id` (доступ через MCC).

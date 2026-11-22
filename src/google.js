@@ -559,6 +559,8 @@ async function finalUrlTool(env, args) {
 }
 
 const ASSET_FIELDS = ["SITELINK", "CALLOUT", "PROMOTION", "PRICE", "STRUCTURED_SNIPPET", "CALL"];
+// минимум текстов в группе объектов Performance Max (меньше Google не примет)
+const GROUP_TEXT_MIN = { HEADLINE: 3, LONG_HEADLINE: 1, DESCRIPTION: 2 };
 
 async function assetsTool(env, args) {
   const cid = await customerOf(env, args);
@@ -580,6 +582,17 @@ async function assetsTool(env, args) {
   if (action === "unlink") {
     const asset = idOf(args.asset_id, "asset_id");
     const field = String(args.field_type || "").toUpperCase();
+    // тексты Performance Max живут в группе объектов, а не в кампании
+    if (args.asset_group_id) {
+      const group = idOf(args.asset_group_id, "asset_group_id");
+      if (!GROUP_TEXT_MIN[field]) throw new Error(`asset_group_id: field_type ${Object.keys(GROUP_TEXT_MIN).join(", ")}`);
+      const rows = await gaql(env, cid, `SELECT asset.id, asset.text_asset.text FROM asset_group_asset WHERE asset_group.id = ${group} AND asset_group_asset.status = 'ENABLED' AND asset_group_asset.field_type = '${field}'`, login);
+      const hit = rows.find((r) => String(r.asset.id) === asset);
+      if (!hit) throw new Error(`Текст ${asset} (${field}) не подключён к группе ${group}`);
+      if (rows.length - 1 < GROUP_TEXT_MIN[field]) throw new Error(`В группе останется ${rows.length - 1} (${field}), нужно не меньше ${GROUP_TEXT_MIN[field]} — сначала добавьте замену`);
+      const res = await mutate(env, cid, [{ assetGroupAssetOperation: { remove: `customers/${cid}/assetGroupAssets/${group}~${asset}~${field}` } }], args.apply, login);
+      return { customer_id: cid, ...res, unlinked: [{ level: "asset_group", asset_group: group, field, text: hit.asset.textAsset?.text ?? null }], left: rows.length - 1, note: "Сам текст не удаляется — его можно подключить обратно в Google Ads" };
+    }
     if (!ASSET_FIELDS.includes(field)) throw new Error(`field_type: ${ASSET_FIELDS.join(", ")}`);
     const now = (await linked()).filter((l) => l.asset_id === asset && l.field === field);
     const hits = args.account ? now.filter((l) => l.level === "account") : now.filter((l) => l.level === "campaign" && (!camps.length || camps.includes(l.campaign_id)));
@@ -844,12 +857,13 @@ export const GOOGLE_TOOLS = [
   },
   {
     name: "google_ads_assets",
-    description: "Google Ads, ПРАВКА расширений: action=list — быстрые ссылки, уточнения, промоакции, прайс-листы, структурированные описания и звонки (аккаунт и включённые кампании); unlink — отключить объект (asset_id + field_type) от кампаний campaign_ids (пусто — от всех) или от аккаунта (account: true), сам объект остаётся; add_callouts — уточнения (до 25 знаков) к кампаниям; add_sitelinks — быстрые ссылки [{text до 25, url, description1/2 до 35}] к кампаниям. Без apply: true — только проверка.",
+    description: "Google Ads, ПРАВКА расширений: action=list — быстрые ссылки, уточнения, промоакции, прайс-листы, структурированные описания и звонки (аккаунт и включённые кампании); unlink — отключить объект (asset_id + field_type) от кампаний campaign_ids (пусто — от всех), от аккаунта (account: true) или текст Performance Max (HEADLINE, LONG_HEADLINE, DESCRIPTION) от группы объектов asset_group_id, сам объект остаётся; add_callouts — уточнения (до 25 знаков) к кампаниям; add_sitelinks — быстрые ссылки [{text до 25, url, description1/2 до 35}] к кампаниям. Без apply: true — только проверка.",
     inputSchema: obj({
       ...CID, ...LOGIN,
       action: { type: "string", enum: ["list", "unlink", "add_callouts", "add_sitelinks"] },
       asset_id: { type: "string" },
-      field_type: { type: "string", enum: ["SITELINK", "CALLOUT", "PROMOTION", "PRICE", "STRUCTURED_SNIPPET", "CALL"] },
+      field_type: { type: "string", enum: ["SITELINK", "CALLOUT", "PROMOTION", "PRICE", "STRUCTURED_SNIPPET", "CALL", "HEADLINE", "LONG_HEADLINE", "DESCRIPTION"] },
+      asset_group_id: { type: "string", description: "unlink: группа объектов Performance Max (для текстов HEADLINE, LONG_HEADLINE, DESCRIPTION)" },
       account: { type: "boolean", description: "unlink: отключить от аккаунта (а не от кампаний)" },
       campaign_ids: { type: "array", items: { type: "string" } },
       callouts: { type: "array", items: { type: "string" } },
