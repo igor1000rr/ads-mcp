@@ -52,6 +52,8 @@ https://ads-mcp.<аккаунт>.workers.dev/<MCP_SECRET>/mcp
 | `google_ads_campaign_goal(campaign_id, category, origin, biddable, apply?)` | Участвует ли цель в ставках кампании |
 | `google_ads_pin_headlines(ad_id, texts, position, apply?)` | Закрепление существующих заголовков объявления (тексты не меняются) |
 | `google_ads_campaign_budget(campaign_id, daily_budget, shared?, apply?)` | Дневной бюджет кампании; общий бюджет — только с `shared: true` |
+| `google_ads_budget_plan(action, items?, weekend_days?, apply?)` | Бюджет по дням недели: будни / выходные (по умолчанию пт–вс); воркер сам ставит нужный каждый час (cron) |
+| `google_ads_ad_schedule(action, campaign_ids?, start_hour?, end_hour?, apply?)` | Часы показа рекламы для кампаний; поправки ставок по дням сохраняются |
 | `google_ads_keyword_match(campaign_id, keywords?, to_match?, apply?)` | Широкие слова → фразовые/точные: копия с новым типом, старое на паузу |
 | `google_ads_geo(campaign_id, action, location_ids?, negative?, apply?)` | Места показа и исключения кампании; без единого места показа кампанию не оставляет |
 | `google_ads_campaign_negatives(campaign_id, action, keywords?, contains?, apply?)` | Минус-слова одной кампании (и Performance Max) |

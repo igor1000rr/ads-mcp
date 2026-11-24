@@ -8,6 +8,10 @@ workers_dev = true
 binding = "STATE"
 id = "0941b0420fa64e8bbbdf99414d8c88b6"
 
+# каждый час в :07 — бюджет Google Ads по дням недели (google_ads_budget_plan)
+[triggers]
+crons = ["7 * * * *"]
+
 [observability]
 enabled = true
 

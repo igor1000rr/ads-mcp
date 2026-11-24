@@ -30,7 +30,7 @@ jobs:
       - name: Call
         run: |
           set -euo pipefail
-          TOOLS='^google_ads_(geo|campaign_negatives|negative_keywords|ad_edit|final_url|assets|conversion_create)$'
+          TOOLS='^google_ads_(geo|campaign_negatives|negative_keywords|ad_edit|final_url|assets|conversion_create|ad_schedule|budget_plan)$'
           echo "$CALLS" | jq -e --arg re "$TOOLS" 'type == "array" and length > 0 and length <= 40
             and all(.[]; (.name | type == "string" and test($re)) and (.arguments | type == "object"))' >/dev/null \
             || { echo 'calls: [{"name": "google_ads_…", "arguments": {…}}], до 40 штук'; exit 1; }

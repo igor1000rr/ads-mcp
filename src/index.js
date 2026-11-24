@@ -8,7 +8,7 @@
 //   Google Ads — необязательно (страница /google сохраняет всё в KV): GOOGLE_ADS_CLIENT_ID, GOOGLE_ADS_CLIENT_SECRET,
 //   GOOGLE_ADS_REFRESH_TOKEN, GOOGLE_ADS_LOGIN_CUSTOMER_ID, GOOGLE_ADS_CUSTOMER_ID.
 
-import { GOOGLE_TOOLS, googleRoute, googleTool } from "./google.js";
+import { GOOGLE_TOOLS, googleRoute, googleTool, runBudgetPlan } from "./google.js";
 
 const PROTOCOL = "2025-06-18";
 const MAX_OUT = 50000;
@@ -325,5 +325,10 @@ export default {
     const res = await handleMessage(body, env);
     if (!res) return new Response(null, { status: 202 });
     return new Response(JSON.stringify(res), { headers: JSON_HEADERS });
+  },
+
+  // каждый час: бюджет Google Ads по дням недели (google_ads_budget_plan), если план сохранён
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runBudgetPlan(env).catch((e) => console.log("budget plan:", e.message)));
   },
 };

@@ -188,6 +188,7 @@ const PERIOD = {
 };
 const obj = (properties, required) => ({ type: "object", properties, ...(required ? { required } : {}), additionalProperties: false });
 const MATCH = ["PHRASE", "EXACT", "BROAD"];
+const DAYS_ENUM = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"];
 
 // ---------- правки ----------
 // Только то, что ниже: минус-слова аккаунта и кампании, настройки и создание конверсии, цели кампании, бюджет, соответствие
@@ -343,6 +344,128 @@ async function budgetTool(env, args) {
   const micros = String(Math.round(amount * 100) * 10000);
   const res = await mutate(env, cid, [{ campaignBudgetOperation: { update: { resourceName: b.resourceName, amountMicros: micros }, updateMask: "amount_micros" } }], args.apply, login);
   return { customer_id: cid, ...res, campaign: row.campaign.name, ...(sharedWith ? { shared_with: sharedWith } : {}), before: money(b.amountMicros), after: money(micros) };
+}
+
+// ---------- расписание показов и бюджет по дням недели ----------
+
+const DAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"];
+const hourOf = (v, what) => {
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0 || n > 24) throw new Error(`${what} — целый час 0…24`);
+  return n;
+};
+
+async function scheduleTool(env, args) {
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const ids = (args.campaign_ids || []).map((v) => idOf(v, "campaign_ids"));
+  const where = ids.length ? ` AND campaign.id IN (${ids.join(",")})` : "";
+  const rows = await gaql(env, cid, `SELECT campaign.id, campaign.name, campaign_criterion.resource_name, campaign_criterion.ad_schedule.day_of_week, campaign_criterion.ad_schedule.start_hour, campaign_criterion.ad_schedule.start_minute, campaign_criterion.ad_schedule.end_hour, campaign_criterion.ad_schedule.end_minute, campaign_criterion.bid_modifier FROM campaign_criterion WHERE campaign_criterion.type = 'AD_SCHEDULE' AND campaign.status != 'REMOVED'${where}`, login);
+  const cur = rows.map((r) => ({
+    campaign: r.campaign.id, name: r.campaign.name, resource: r.campaignCriterion.resourceName,
+    day: r.campaignCriterion.adSchedule.dayOfWeek, start: Number(r.campaignCriterion.adSchedule.startHour || 0), end: Number(r.campaignCriterion.adSchedule.endHour || 0),
+    startMin: r.campaignCriterion.adSchedule.startMinute, endMin: r.campaignCriterion.adSchedule.endMinute,
+    bid: r.campaignCriterion.bidModifier,
+  }));
+  const show = (list) => list.map((x) => `${x.name}: ${x.day} ${x.start}:00–${x.end}:00${x.bid && x.bid !== 1 ? ` (ставка ×${x.bid})` : ""}`);
+  if ((args.action || "list") === "list") return { customer_id: cid, schedule: show(cur) };
+  if (args.action !== "set") throw new Error("action: list или set");
+  if (!ids.length) throw new Error("campaign_ids — какие кампании менять");
+  const start = hourOf(args.start_hour, "start_hour");
+  const end = hourOf(args.end_hour, "end_hour");
+  if (end <= start) throw new Error("end_hour должен быть позже start_hour");
+  const ops = [];
+  const after = [];
+  for (const camp of ids) {
+    const mine = cur.filter((x) => x.campaign === camp);
+    // нет расписания — показы круглосуточно; создаём на все 7 дней
+    const base = mine.length ? mine : DAYS.map((day) => ({ campaign: camp, name: camp, day, start: -1, end: -1, bid: undefined }));
+    for (const x of base) {
+      if (x.start === start && x.end === end && x.startMin === "ZERO" && x.endMin === "ZERO") { after.push(x); continue; }
+      // день и часы у расписания не меняются — удаляем и создаём заново с той же поправкой ставки
+      if (x.resource) ops.push({ campaignCriterionOperation: { remove: x.resource } });
+      ops.push({ campaignCriterionOperation: { create: {
+        campaign: `customers/${cid}/campaigns/${camp}`,
+        adSchedule: { dayOfWeek: x.day, startHour: start, startMinute: "ZERO", endHour: end, endMinute: "ZERO" },
+        ...(x.bid && x.bid !== 1 ? { bidModifier: x.bid } : {}),
+      } } });
+      after.push({ ...x, start, end });
+    }
+  }
+  const res = await mutate(env, cid, ops, args.apply, login);
+  return { customer_id: cid, ...res, before: show(cur.filter((x) => ids.includes(x.campaign))), after: show(after) };
+}
+
+const PLAN = "budget_plan";
+const PLAN_LOG = "budget_plan_log";
+
+async function accountDay(env, plan) {
+  const tz = plan.time_zone || "Europe/Warsaw";
+  return new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" }).format(new Date()).toUpperCase();
+}
+
+/** Ставит бюджеты плана на текущий день недели (в часовом поясе аккаунта). Повторный запуск ничего не меняет. */
+export async function runBudgetPlan(env, opts = {}) {
+  const plan = opts.plan || (await kvGet(env, PLAN));
+  if (!plan?.items?.length) return null;
+  const day = await accountDay(env, plan);
+  const weekend = (plan.weekend_days || []).includes(day);
+  const results = [];
+  for (const it of plan.items) {
+    const target = weekend ? it.weekend : it.weekday;
+    try {
+      const [row] = await gaql(env, plan.customer_id, `SELECT campaign.name, campaign_budget.amount_micros FROM campaign WHERE campaign.id = ${idOf(it.campaign_id, "campaign_id")}`, plan.login_customer_id);
+      const now = money(row?.campaignBudget?.amountMicros);
+      if (Math.abs(now - target) < 0.01) { results.push({ campaign: row?.campaign?.name || it.campaign_id, budget: now, changed: false }); continue; }
+      const r = await budgetTool(env, { customer_id: plan.customer_id, login_customer_id: plan.login_customer_id, campaign_id: it.campaign_id, daily_budget: target, shared: Boolean(it.shared), apply: opts.apply !== false });
+      results.push({ campaign: r.campaign, before: r.before, budget: r.after, changed: r.applied });
+    } catch (e) {
+      results.push({ campaign: it.campaign_id, error: String(e.message || e).slice(0, 300) });
+    }
+  }
+  const log = { at: new Date().toISOString(), day, weekend, results };
+  if (opts.apply !== false && env.STATE) await kvPut(env, PLAN_LOG, log);
+  return log;
+}
+
+async function budgetPlanTool(env, args) {
+  const action = args.action || "show";
+  if (action === "show") {
+    const [plan, last] = await Promise.all([kvGet(env, PLAN), kvGet(env, PLAN_LOG)]);
+    return { plan: plan || "нет плана — бюджеты не меняются по дням", last_run: last };
+  }
+  if (action === "clear") {
+    if (args.apply) await env.STATE.delete(PLAN);
+    return { applied: Boolean(args.apply), plan: null, note: "бюджеты остаются такими, какие стоят сейчас" };
+  }
+  if (action === "run") {
+    const plan = await kvGet(env, PLAN);
+    if (!plan) throw new Error("плана нет — сначала action=set");
+    const log = await runBudgetPlan(env, { plan, apply: Boolean(args.apply) });
+    return { applied: Boolean(args.apply), ...log };
+  }
+  if (action !== "set") throw new Error("action: show, set, run или clear");
+  const cid = await customerOf(env, args);
+  const login = loginOf(args);
+  const weekendDays = (args.weekend_days?.length ? args.weekend_days : ["FRIDAY", "SATURDAY", "SUNDAY"]).map((d) => String(d).toUpperCase());
+  if (weekendDays.some((d) => !DAYS.includes(d))) throw new Error(`weekend_days: ${DAYS.join(", ")}`);
+  const items = (args.items || []).map((it) => {
+    const weekday = Number(it.weekday);
+    const weekend = Number(it.weekend);
+    if (!(weekday > 0 && weekend > 0 && weekday <= 100000 && weekend <= 100000)) throw new Error("items: weekday и weekend — бюджет в день, больше 0");
+    return { campaign_id: idOf(it.campaign_id, "campaign_id"), weekday, weekend, shared: Boolean(it.shared) };
+  });
+  if (!items.length) throw new Error("items — [{campaign_id, weekday, weekend, shared?}]");
+  const [tzRow] = await gaql(env, cid, "SELECT customer.time_zone FROM customer LIMIT 1", login);
+  // проверка: каждая правка проходит validateOnly (кампания есть, общий бюджет помечен shared)
+  for (const it of items) {
+    await budgetTool(env, { customer_id: cid, login_customer_id: login, campaign_id: it.campaign_id, daily_budget: it.weekday, shared: it.shared });
+  }
+  const plan = { customer_id: cid, login_customer_id: login, time_zone: tzRow?.customer?.timeZone || "Europe/Warsaw", weekend_days: weekendDays, items, saved_at: new Date().toISOString() };
+  if (!args.apply) return { applied: false, plan };
+  await kvPut(env, PLAN, plan);
+  const now = await runBudgetPlan(env, { plan });
+  return { applied: true, plan, now };
 }
 
 async function keywordMatchTool(env, args) {
@@ -827,6 +950,31 @@ export const GOOGLE_TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: false },
   },
   {
+    name: "google_ads_ad_schedule",
+    description: "Google Ads, ПРАВКА: часы показа рекламы (одинаковые на все дни). action=list — показать расписание; set — поставить start_hour…end_hour для campaign_ids, поправки ставок по дням сохраняются. Часы — в часовом поясе аккаунта. Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      action: { type: "string", enum: ["list", "set"] },
+      campaign_ids: { type: "array", items: { type: "string" } },
+      start_hour: { type: "integer", description: "С какого часа, 0…23" },
+      end_hour: { type: "integer", description: "До какого часа, 1…24" },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["action"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "google_ads_budget_plan",
+    description: "Google Ads, ПРАВКА: бюджет по дням недели — в будни один, в выходные (по умолчанию пт–вс) другой. Воркер сам ставит нужный бюджет каждый час (по часовому поясу аккаунта). action=show — план и последний запуск; set — сохранить план и сразу применить сегодняшний бюджет; run — применить сейчас; clear — убрать план (бюджеты остаются как есть). Без apply: true — только проверка.",
+    inputSchema: obj({
+      ...CID, ...LOGIN,
+      action: { type: "string", enum: ["show", "set", "run", "clear"] },
+      items: { type: "array", items: obj({ campaign_id: { type: "string" }, weekday: { type: "number" }, weekend: { type: "number" }, shared: { type: "boolean", description: "общий бюджет на несколько кампаний" } }, ["campaign_id", "weekday", "weekend"]) },
+      weekend_days: { type: "array", items: { type: "string", enum: DAYS_ENUM } },
+      apply: { type: "boolean", description: "true — применить; иначе только проверка" },
+    }, ["action"]),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
     name: "google_ads_keyword_match",
     description: "Google Ads, ПРАВКА: перевести ключевые слова кампании из широкого (BROAD) в фразовое или точное соответствие. Google не меняет тип у существующего слова, поэтому создаётся копия с новым типом, а старое ставится на паузу (откат — включить старое). keywords пусто — все включённые широкие слова кампании. Без apply: true — только проверка.",
     inputSchema: obj({
@@ -1062,6 +1210,10 @@ export async function googleTool(name, args, env) {
       return pinTool(env, args);
     case "google_ads_campaign_budget":
       return budgetTool(env, args);
+    case "google_ads_ad_schedule":
+      return scheduleTool(env, args);
+    case "google_ads_budget_plan":
+      return budgetPlanTool(env, args);
     case "google_ads_keyword_match":
       return keywordMatchTool(env, args);
     case "google_ads_geo":
