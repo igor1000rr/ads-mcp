@@ -57,7 +57,7 @@ https://ads-mcp.<аккаунт>.workers.dev/<MCP_SECRET>/mcp
 | `google_ads_keyword_match(campaign_id, keywords?, to_match?, apply?)` | Широкие слова → фразовые/точные: копия с новым типом, старое на паузу |
 | `google_ads_geo(campaign_id, action, location_ids?, negative?, apply?)` | Места показа и исключения кампании; без единого места показа кампанию не оставляет |
 | `google_ads_campaign_negatives(campaign_id, action, keywords?, contains?, apply?)` | Минус-слова одной кампании (и Performance Max) |
-| `google_ads_ad_edit(ad_id, replace?, remove?, add_headlines?, add_descriptions?, apply?)` | Тексты адаптивного поискового объявления; закрепление сохраняется |
+| `google_ads_ad_edit(ad_id, replace?, remove?, add_headlines?, add_descriptions?, path1?, path2?, apply?)` | Тексты и отображаемый путь адаптивного поискового объявления; закрепление сохраняется |
 | `google_ads_final_url(ad_id \| asset_group_id \| asset_id, final_url, apply?)` | Конечная ссылка объявления, группы объектов PMax, быстрой ссылки или промоакции — только на свой сайт |
 | `google_ads_assets(action, …, apply?)` | Расширения: `list`, `unlink` (объект остаётся; с `asset_group_id` — текст Performance Max), `link` (подключить существующий обратно), `add_texts` (новые тексты Performance Max в группу `asset_group_id`), `add_callouts`, `add_sitelinks` |
 | `google_ads_conversion_create(name, category?, default_value?, primary_for_goal?, apply?)` | Новая конверсия для тега на сайте, по умолчанию не основная; возвращает `send_to` |

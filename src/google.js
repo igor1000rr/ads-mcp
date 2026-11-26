@@ -605,7 +605,7 @@ async function adEditTool(env, args) {
   const cid = await customerOf(env, args);
   const login = loginOf(args);
   const id = idOf(args.ad_id, "ad_id");
-  const [row] = await gaql(env, cid, `SELECT ad_group_ad.ad.resource_name, ad_group_ad.ad.type, ad_group_ad.ad.responsive_search_ad.headlines, ad_group_ad.ad.responsive_search_ad.descriptions FROM ad_group_ad WHERE ad_group_ad.ad.id = ${id} LIMIT 1`, login);
+  const [row] = await gaql(env, cid, `SELECT ad_group_ad.ad.resource_name, ad_group_ad.ad.type, ad_group_ad.ad.responsive_search_ad.headlines, ad_group_ad.ad.responsive_search_ad.descriptions, ad_group_ad.ad.responsive_search_ad.path1, ad_group_ad.ad.responsive_search_ad.path2 FROM ad_group_ad WHERE ad_group_ad.ad.id = ${id} LIMIT 1`, login);
   const ad = row?.adGroupAd?.ad;
   if (!ad) throw new Error(`Объявление ${id} не найдено`);
   if (ad.type !== "RESPONSIVE_SEARCH_AD") throw new Error(`Объявление ${id} — не адаптивное поисковое (${ad.type})`);
@@ -643,10 +643,23 @@ async function adEditTool(env, args) {
   const mask = [];
   if (!same(hl, before.headlines)) { rsa.headlines = hl; mask.push("responsiveSearchAd.headlines"); }
   if (!same(ds, before.descriptions)) { rsa.descriptions = ds; mask.push("responsiveSearchAd.descriptions"); }
-  if (!mask.length) throw new Error("Нечего менять: replace, remove, add_headlines, add_descriptions");
+  // отображаемый путь в адресе объявления (сайт.pl/path1/path2): до 15 знаков, без пробелов и «/»; "" — убрать
+  const path = { path1: ad.responsiveSearchAd?.path1 || "", path2: ad.responsiveSearchAd?.path2 || "" };
+  for (const k of ["path1", "path2"]) {
+    if (args[k] === undefined) continue;
+    const v = String(args[k]).trim();
+    if (len(v) > 15) throw new Error(`${k} «${v}» — ${len(v)} знаков, максимум 15`);
+    if (/[\s/]/.test(v)) throw new Error(`${k}: без пробелов и «/»`);
+    path[k] = v;
+  }
+  if (path.path2 && !path.path1) throw new Error("path2 без path1 не показывается — задайте path1");
+  for (const k of ["path1", "path2"]) {
+    if (path[k] !== (ad.responsiveSearchAd?.[k] || "")) { rsa[k] = path[k]; mask.push(`responsiveSearchAd.${k}`); }
+  }
+  if (!mask.length) throw new Error("Нечего менять: replace, remove, add_headlines, add_descriptions, path1, path2");
   const res = await mutate(env, cid, [{ adOperation: { update: { resourceName: ad.resourceName, responsiveSearchAd: rsa }, updateMask: mask.join(",") } }], args.apply, login);
   const show = (list) => list.map((t) => (t.pinnedField ? `${t.text}  [${t.pinnedField}]` : t.text));
-  return { customer_id: cid, ad_id: id, ...res, headlines: show(hl), descriptions: show(ds) };
+  return { customer_id: cid, ad_id: id, ...res, headlines: show(hl), descriptions: show(ds), path: [path.path1, path.path2].filter(Boolean).join("/") };
 }
 
 async function finalUrlTool(env, args) {
@@ -1054,7 +1067,7 @@ export const GOOGLE_TOOLS = [
   },
   {
     name: "google_ads_ad_edit",
-    description: "Google Ads, ПРАВКА текстов адаптивного поискового объявления: replace [{from, to}] — заменить заголовок или описание (закрепление сохраняется), remove — убрать тексты, add_headlines / add_descriptions — добавить. Заголовок до 30 знаков, описание до 90; заголовков 3–15, описаний 2–4. Объявление уходит на повторную проверку Google. Без apply: true — только проверка.",
+    description: "Google Ads, ПРАВКА текстов адаптивного поискового объявления: replace [{from, to}] — заменить заголовок или описание (закрепление сохраняется), remove — убрать тексты, add_headlines / add_descriptions — добавить, path1 / path2 — отображаемый путь в адресе (до 15 знаков, \"\" — убрать). Заголовок до 30 знаков, описание до 90; заголовков 3–15, описаний 2–4. Объявление уходит на повторную проверку Google. Без apply: true — только проверка.",
     inputSchema: obj({
       ...CID, ...LOGIN,
       ad_id: { type: "string" },
@@ -1062,6 +1075,8 @@ export const GOOGLE_TOOLS = [
       remove: { type: "array", items: { type: "string" } },
       add_headlines: { type: "array", items: { type: "string" } },
       add_descriptions: { type: "array", items: { type: "string" } },
+      path1: { type: "string", description: "Первая часть отображаемого пути (сайт.pl/path1), до 15 знаков" },
+      path2: { type: "string", description: "Вторая часть (сайт.pl/path1/path2), до 15 знаков" },
       apply: { type: "boolean", description: "true — применить; иначе только проверка" },
     }, ["ad_id"]),
     annotations: { readOnlyHint: false, destructiveHint: false },
