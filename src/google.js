@@ -374,12 +374,17 @@ async function scheduleTool(env, args) {
   const start = hourOf(args.start_hour, "start_hour");
   const end = hourOf(args.end_hour, "end_hour");
   if (end <= start) throw new Error("end_hour должен быть позже start_hour");
+  // days — только эти дни (например, один короткий день), остальные дни не трогаем
+  const days = [...new Set((args.days || []).map((d) => String(d).toUpperCase()))];
+  for (const d of days) if (!DAYS.includes(d)) throw new Error(`days: ${DAYS.join(", ")}`);
   const ops = [];
   const after = [];
   for (const camp of ids) {
     const mine = cur.filter((x) => x.campaign === camp);
+    if (days.length && !mine.length) throw new Error(`У кампании ${camp} нет расписания: сначала задайте часы на все дни (без days)`);
+    const blank = (day) => ({ campaign: camp, name: mine[0]?.name ?? camp, day, start: -1, end: -1, bid: undefined });
     // нет расписания — показы круглосуточно; создаём на все 7 дней
-    const base = mine.length ? mine : DAYS.map((day) => ({ campaign: camp, name: camp, day, start: -1, end: -1, bid: undefined }));
+    const base = days.length ? days.map((d) => mine.find((x) => x.day === d) ?? blank(d)) : mine.length ? mine : DAYS.map(blank);
     for (const x of base) {
       if (x.start === start && x.end === end && x.startMin === "ZERO" && x.endMin === "ZERO") { after.push(x); continue; }
       // день и часы у расписания не меняются — удаляем и создаём заново с той же поправкой ставки
@@ -393,7 +398,8 @@ async function scheduleTool(env, args) {
     }
   }
   const res = await mutate(env, cid, ops, args.apply, login);
-  return { customer_id: cid, ...res, before: show(cur.filter((x) => ids.includes(x.campaign))), after: show(after) };
+  const untouched = days.length ? cur.filter((x) => ids.includes(x.campaign) && !days.includes(x.day)) : [];
+  return { customer_id: cid, ...res, before: show(cur.filter((x) => ids.includes(x.campaign))), after: show([...after, ...untouched]) };
 }
 
 const PLAN = "budget_plan";
@@ -984,13 +990,14 @@ export const GOOGLE_TOOLS = [
   },
   {
     name: "google_ads_ad_schedule",
-    description: "Google Ads, ПРАВКА: часы показа рекламы (одинаковые на все дни). action=list — показать расписание; set — поставить start_hour…end_hour для campaign_ids, поправки ставок по дням сохраняются. Часы — в часовом поясе аккаунта. Без apply: true — только проверка.",
+    description: "Google Ads, ПРАВКА: часы показа рекламы. action=list — показать расписание; set — поставить start_hour…end_hour для campaign_ids на все дни или только на days (например, [\"SUNDAY\"]), поправки ставок по дням сохраняются. Часы — в часовом поясе аккаунта. Без apply: true — только проверка.",
     inputSchema: obj({
       ...CID, ...LOGIN,
       action: { type: "string", enum: ["list", "set"] },
       campaign_ids: { type: "array", items: { type: "string" } },
       start_hour: { type: "integer", description: "С какого часа, 0…23" },
       end_hour: { type: "integer", description: "До какого часа, 1…24" },
+      days: { type: "array", items: { type: "string", enum: DAYS_ENUM }, description: "set: только эти дни (пусто — все дни)" },
       apply: { type: "boolean", description: "true — применить; иначе только проверка" },
     }, ["action"]),
     annotations: { readOnlyHint: false, destructiveHint: false },
