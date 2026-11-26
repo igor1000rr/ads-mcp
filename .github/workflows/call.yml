@@ -1,0 +1,58 @@
+name: Call Google Ads tools
+
+# Правки Google Ads тем же воркером, что и коннектор (те же проверки; без "apply": true — только проверка Google).
+# Репозиторий публичный: в журнал — только итог по каждому вызову (применено / ошибка / send_to), без данных отчётов.
+on:
+  workflow_dispatch:
+    inputs:
+      calls:
+        description: 'JSON: [{"name":"google_ads_geo","arguments":{…}}, …] — до 40 правок'
+        required: true
+  # push этого файла регистрирует workflow для запуска по кнопке; сам push ничего не делает
+  push:
+    branches: [claude/google-ads-v26]
+    paths: [.github/workflows/call.yml]
+
+concurrency:
+  group: google-ads-call
+  cancel-in-progress: false
+
+jobs:
+  call:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CALLS: ${{ inputs.calls }}
+      SECRET: ${{ secrets.MCP_SECRET }}
+      HOST: ads-mcp.igorsuhockii.workers.dev
+    steps:
+      - name: Call
+        run: |
+          set -euo pipefail
+          TOOLS='^google_ads_(geo|campaign_negatives|negative_keywords|ad_edit|final_url|assets|conversion_create|ad_schedule|budget_plan)$'
+          echo "$CALLS" | jq -e --arg re "$TOOLS" 'type == "array" and length > 0 and length <= 40
+            and all(.[]; (.name | type == "string" and test($re)) and (.arguments | type == "object"))' >/dev/null \
+            || { echo 'calls: [{"name": "google_ads_…", "arguments": {…}}], до 40 штук'; exit 1; }
+          fail=0
+          i=0
+          while read -r c; do
+            i=$((i + 1))
+            body=$(jq -cn --argjson c "$c" --argjson id "$i" '{jsonrpc: "2.0", id: $id, method: "tools/call", params: {name: $c.name, arguments: $c.arguments}}')
+            res=$(curl -sS --max-time 60 -X POST "https://$HOST/$SECRET/mcp" -H 'Content-Type: application/json' -d "$body" || true)
+            echo "$res" | jq -e 'type == "object"' >/dev/null 2>&1 || res='{}'
+            line=$(jq -rn --argjson c "$c" --argjson r "$res" --argjson i "$i" '
+              ($r.result.content[0].text // ($r.error.message // "нет ответа")) as $t
+              | ($r.result.isError // ($r.result == null)) as $err
+              | ($t | try fromjson catch null) as $j
+              | "\($i). \($c.name) \($c.arguments | del(.apply) | tostring | .[0:160]) → "
+                + (if $err then "ОШИБКА: \($t | .[0:400])"
+                   else (if $j.applied then "применено" else "проверено (без apply)" end)
+                     + (if $j.send_to then ", send_to: \($j.send_to | join(" "))" else "" end)
+                     + (if $j.conversion_action_id then ", id: \($j.conversion_action_id)" else "" end)
+                     + (if $j.not_found and ($j.not_found | length) > 0 then ", не найдено: \($j.not_found | map(.text) | join(", "))" else "" end)
+                   end)')
+            echo "$line"
+            case "$line" in *"ОШИБКА:"*) fail=1 ;; esac
+          done < <(echo "$CALLS" | jq -c '.[]')
+          exit $fail
