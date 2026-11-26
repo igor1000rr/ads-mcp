@@ -686,6 +686,7 @@ const ASSET_FIELDS = ["SITELINK", "CALLOUT", "PROMOTION", "PRICE", "STRUCTURED_S
 const GROUP_TEXT_MIN = { HEADLINE: 3, LONG_HEADLINE: 1, DESCRIPTION: 2 };
 // и максимум (больше Google не примет)
 const GROUP_TEXT_MAX = { HEADLINE: 15, LONG_HEADLINE: 5, DESCRIPTION: 5 };
+const GROUP_TEXT_LEN = { HEADLINE: 30, LONG_HEADLINE: 90, DESCRIPTION: 90 };
 
 async function assetsTool(env, args) {
   const cid = await customerOf(env, args);
@@ -763,7 +764,39 @@ async function assetsTool(env, args) {
     return { customer_id: cid, ...res, items: out };
   }
 
-  if (action !== "add_callouts" && action !== "add_sitelinks") throw new Error("action: list, unlink, link, add_callouts, add_sitelinks");
+  if (action === "add_texts") {
+    // новые тексты Performance Max в группу объектов; такой же текст уже есть в аккаунте — подключаем его, копий не плодим
+    if (!args.asset_group_id) throw new Error("asset_group_id — группа объектов Performance Max");
+    const group = idOf(args.asset_group_id, "asset_group_id");
+    const field = String(args.field_type || "").toUpperCase();
+    const max = GROUP_TEXT_LEN[field];
+    if (!max) throw new Error(`field_type: ${Object.keys(GROUP_TEXT_LEN).join(", ")}`);
+    const texts = [...new Set((args.texts || []).map((t) => String(t).trim()))];
+    if (!texts.length) throw new Error("texts — тексты для группы");
+    for (const t of texts) if (!t || len(t) > max) throw new Error(`«${t}» — нужно 1–${max} знаков`);
+    const rows = await gaql(env, cid, `SELECT asset.id, asset.text_asset.text FROM asset_group_asset WHERE asset_group.id = ${group} AND asset_group_asset.status = 'ENABLED' AND asset_group_asset.field_type = '${field}'`, login);
+    const fresh = texts.filter((t) => !rows.some((r) => r.asset.textAsset?.text === t));
+    if (rows.length + fresh.length > GROUP_TEXT_MAX[field]) throw new Error(`В группе ${rows.length} (${field}), с новыми будет ${rows.length + fresh.length}, максимум ${GROUP_TEXT_MAX[field]} — сначала отключите лишнее`);
+    const quote = (t) => `'${t.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+    const twins = fresh.length ? await gaql(env, cid, `SELECT asset.id, asset.text_asset.text FROM asset WHERE asset.type = 'TEXT' AND asset.text_asset.text IN (${fresh.map(quote).join(", ")})`, login) : [];
+    const ops = [];
+    const out = texts.filter((t) => !fresh.includes(t)).map((t) => ({ text: t, result: "уже в группе" }));
+    let tmp = 0;
+    for (const t of fresh) {
+      const twin = twins.find((r) => r.asset.textAsset?.text === t);
+      let asset = twin ? `customers/${cid}/assets/${twin.asset.id}` : null;
+      if (!asset) {
+        asset = `customers/${cid}/assets/-${++tmp}`;
+        ops.push({ assetOperation: { create: { resourceName: asset, textAsset: { text: t } } } });
+      }
+      ops.push({ assetGroupAssetOperation: { create: { asset, assetGroup: `customers/${cid}/assetGroups/${group}`, fieldType: field } } });
+      out.push({ text: t, result: twin ? "подключено существующее" : "новое" });
+    }
+    const res = ops.length ? await mutate(env, cid, ops, args.apply, login) : { applied: false };
+    return { customer_id: cid, ...res, asset_group: group, field, items: out, total: rows.length + fresh.length };
+  }
+
+  if (action !== "add_callouts" && action !== "add_sitelinks") throw new Error("action: list, unlink, link, add_texts, add_callouts, add_sitelinks");
   if (!camps.length) throw new Error("campaign_ids — к каким кампаниям подключить");
   const names = new Map((await gaql(env, cid, `SELECT campaign.id, campaign.name FROM campaign WHERE campaign.id IN (${camps.join(",")}) AND campaign.status != 'REMOVED'`, login)).map((r) => [String(r.campaign.id), r.campaign.name]));
   const missing = camps.filter((c) => !names.has(c));
@@ -1041,16 +1074,17 @@ export const GOOGLE_TOOLS = [
   },
   {
     name: "google_ads_assets",
-    description: "Google Ads, ПРАВКА расширений: action=list — быстрые ссылки, уточнения, промоакции, прайс-листы, структурированные описания и звонки (аккаунт и включённые кампании); unlink — отключить объект (asset_id + field_type) от кампаний campaign_ids (пусто — от всех), от аккаунта (account: true) или текст Performance Max (HEADLINE, LONG_HEADLINE, DESCRIPTION) от группы объектов asset_group_id, сам объект остаётся; link — подключить существующий объект (asset_id + field_type) обратно к кампаниям campaign_ids или текст к группе asset_group_id; add_callouts — уточнения (до 25 знаков) к кампаниям; add_sitelinks — быстрые ссылки [{text до 25, url, description1/2 до 35}] к кампаниям. Без apply: true — только проверка.",
+    description: "Google Ads, ПРАВКА расширений: action=list — быстрые ссылки, уточнения, промоакции, прайс-листы, структурированные описания и звонки (аккаунт и включённые кампании); unlink — отключить объект (asset_id + field_type) от кампаний campaign_ids (пусто — от всех), от аккаунта (account: true) или текст Performance Max (HEADLINE, LONG_HEADLINE, DESCRIPTION) от группы объектов asset_group_id, сам объект остаётся; link — подключить существующий объект (asset_id + field_type) обратно к кампаниям campaign_ids или текст к группе asset_group_id; add_texts — новые тексты Performance Max texts[] (field_type HEADLINE до 30, LONG_HEADLINE и DESCRIPTION до 90) в группу asset_group_id; add_callouts — уточнения (до 25 знаков) к кампаниям; add_sitelinks — быстрые ссылки [{text до 25, url, description1/2 до 35}] к кампаниям. Без apply: true — только проверка.",
     inputSchema: obj({
       ...CID, ...LOGIN,
-      action: { type: "string", enum: ["list", "unlink", "link", "add_callouts", "add_sitelinks"] },
+      action: { type: "string", enum: ["list", "unlink", "link", "add_texts", "add_callouts", "add_sitelinks"] },
       asset_id: { type: "string" },
       field_type: { type: "string", enum: ["SITELINK", "CALLOUT", "PROMOTION", "PRICE", "STRUCTURED_SNIPPET", "CALL", "HEADLINE", "LONG_HEADLINE", "DESCRIPTION"] },
-      asset_group_id: { type: "string", description: "unlink/link: группа объектов Performance Max (для текстов HEADLINE, LONG_HEADLINE, DESCRIPTION)" },
+      asset_group_id: { type: "string", description: "unlink/link/add_texts: группа объектов Performance Max (для текстов HEADLINE, LONG_HEADLINE, DESCRIPTION)" },
       account: { type: "boolean", description: "unlink: отключить от аккаунта (а не от кампаний)" },
       campaign_ids: { type: "array", items: { type: "string" } },
       callouts: { type: "array", items: { type: "string" } },
+      texts: { type: "array", items: { type: "string" }, description: "add_texts: тексты для группы Performance Max" },
       sitelinks: { type: "array", items: obj({ text: { type: "string" }, url: { type: "string" }, description1: { type: "string" }, description2: { type: "string" } }, ["text", "url"]) },
       apply: { type: "boolean", description: "true — применить; иначе только проверка" },
     }, ["action"]),
